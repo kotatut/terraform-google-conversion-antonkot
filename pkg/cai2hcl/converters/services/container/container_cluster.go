@@ -7,18 +7,17 @@ import (
 	"github.com/GoogleCloudPlatform/terraform-google-conversion/v6/pkg/cai2hcl/converters/utils"
 	"github.com/GoogleCloudPlatform/terraform-google-conversion/v6/pkg/cai2hcl/models"
 	"github.com/GoogleCloudPlatform/terraform-google-conversion/v6/pkg/caiasset"
-	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-provider-google-beta/google-beta/tpgresource"
 	"google.golang.org/api/container/v1"
+	// TODO: Consider adding v1beta1 support for features like auto_monitoring_config
+	// "google.golang.org/api/container/v1beta1"
 )
 
 const ContainerClusterAssetType string = "container.googleapis.com/Cluster"
 const ContainerClusterSchemaName string = "google_container_cluster"
 const ContainerNodePoolSchemaName string = "google_container_node_pool"
-
-// REMOVED: Default values const block is removed as default handling is disabled.
 
 type ContainerClusterConverter struct {
 	clusterName    string
@@ -55,27 +54,20 @@ func NewContainerClusterConverter(provider *schema.Provider) models.Converter {
 }
 
 func (c *ContainerClusterConverter) Convert(asset *caiasset.Asset) ([]*models.TerraformResourceBlock, error) {
-	if asset == nil {
-		// Handle IAM policy conversion if needed, similar to Compute Instance converter
-		// if asset.IAMPolicy != nil { ... }
-		return nil, fmt.Errorf("asset is nil") // Adjusted error message
-	}
-
-	// Ensure resource data exists for cluster conversion
-	if asset.Resource == nil || asset.Resource.Data == nil {
-		// If only IAM policy exists, handle that - otherwise return error or empty list
-		// For now, assume resource data is required for this converter's primary function
-		return nil, fmt.Errorf("asset resource data is nil for cluster conversion")
+	if asset == nil || asset.Resource == nil || asset.Resource.Data == nil {
+		return nil, fmt.Errorf("asset or asset resource data is nil")
 	}
 
 	project := utils.ParseFieldValue(asset.Name, "projects")
 
-	// Try to parse location from either "zones" or "locations" or "regions"
+	// Try to parse location from either "zones" or "locations" field
 	location := utils.ParseFieldValue(asset.Name, "locations")
 	if location == "" {
+		// If locations not found, try zones (for zonal clusters)
 		location = utils.ParseFieldValue(asset.Name, "zones")
 	}
 	if location == "" {
+		// If zones not found, try regions (for regional clusters)
 		location = utils.ParseFieldValue(asset.Name, "regions")
 	}
 
@@ -90,55 +82,40 @@ func (c *ContainerClusterConverter) Convert(asset *caiasset.Asset) ([]*models.Te
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert cluster data: %w", err)
 	}
+	// Allow nil block if conversion results in only defaults (though unlikely for cluster itself)
+	// if clusterBlock == nil && err == nil {
+	// 	return nil, fmt.Errorf("cluster conversion returned nil block without error")
+	// }
 
 	blocks := []*models.TerraformResourceBlock{}
 	if clusterBlock != nil {
 		blocks = append(blocks, clusterBlock)
-	} // Removed warning about minimal block
-
-	// --- Node Pool Conversion ---
-	// Keep the heuristic to decide if separate node pool resources are needed
-	hasSeparateNodePools := false
-	if len(cluster.NodePools) > 1 || (len(cluster.NodePools) == 1 && cluster.NodePools[0] != nil && cluster.NodePools[0].Name != "default-pool") {
-		hasSeparateNodePools = true
+	} else {
+		fmt.Printf("Info: Cluster %s resulted in an empty block after omitting defaults.\n", clusterName)
 	}
 
+	// Convert node pools if they exist in the asset and are not just the default pool handled by cluster block
 	if len(cluster.NodePools) > 0 {
+		// Determine if remove_default_node_pool should be true (implicitly or explicitly)
+		// This logic might need refinement based on how initial_node_count interacts with explicit node pools in the API response.
+		// Simple check: if more than one node pool exists, or if the single existing pool is NOT named "default-pool"
+		hasSeparateNodePools := len(cluster.NodePools) > 1 || (len(cluster.NodePools) == 1 && cluster.NodePools[0] != nil && cluster.NodePools[0].Name != "default-pool")
+
 		for _, nodePool := range cluster.NodePools {
 			if nodePool == nil {
 				continue
 			}
-			// Skip conversion of the default node pool if it's managed by the cluster block
-			// (i.e., not setting remove_default_node_pool = true implicitly)
-			isDefaultPool := nodePool.Name == "default-pool"
-			// If it's the default pool AND we are NOT managing pools separately...
-			// AND clusterBlock exists AND remove_default_node_pool is not explicitly set to true...
-			// then skip creating a separate resource for it.
-			removeDefaultPoolSet := false
-			if clusterBlock != nil {
-				// Check if remove_default_node_pool is explicitly true in the generated HCL data
-				removeDefaultNodePoolAttr := clusterBlock.Value.GetAttr("remove_default_node_pool")
-
-				// Check if the attribute exists, is not null, is a boolean, and is true
-				if !removeDefaultNodePoolAttr.IsNull() && removeDefaultNodePoolAttr.Type() == cty.Bool {
-					if removeDefaultNodePoolAttr.True() {
-						removeDefaultPoolSet = true
-					}
-				}
-			}
-
-			if isDefaultPool && !hasSeparateNodePools && !removeDefaultPoolSet {
-				fmt.Printf("Info: Skipping separate conversion of default node pool '%s' as it's managed by cluster block attributes.\n", nodePool.Name)
+			// Skip conversion if this looks like the default pool AND we are NOT setting remove_default_node_pool=true
+			isDefaultPool := nodePool.Name == "default-pool" // GKE's default pool name
+			if isDefaultPool && !hasSeparateNodePools && clusterBlock != nil && clusterBlock.Value.GetAttr("remove_default_node_pool").IsNull() {
+				fmt.Printf("Info: Skipping conversion of apparent default node pool '%s' as it's likely managed by cluster block attributes.\n", nodePool.Name)
 				continue
 			}
 
 			nodePoolBlock, err := c.convertNodePoolData(nodePool, cluster, project, location)
 			if err != nil {
-				// Changed from Printf to return error to be more explicit
-				return nil, fmt.Errorf("failed to convert node pool %s: %w. Halting conversion.", nodePool.Name, err)
-				// Alternatively, log warning and continue:
-				// fmt.Printf("Warning: Failed to convert node pool %s: %v. Skipping.\n", nodePool.Name, err)
-				// continue
+				fmt.Printf("Warning: Failed to convert node pool %s: %v. Skipping.\n", nodePool.Name, err)
+				continue
 			}
 			if nodePoolBlock != nil {
 				blocks = append(blocks, nodePoolBlock)
@@ -146,140 +123,151 @@ func (c *ContainerClusterConverter) Convert(asset *caiasset.Asset) ([]*models.Te
 		}
 	}
 
-	// Handle IAM policy conversion if present in the asset and needed
-	// Similar to compute instance converter:
-	// if asset.IAMPolicy != nil {
-	//	 iamBlock, err := c.convertIAM(asset) // Assuming convertIAM exists
-	//	 if err != nil {
-	//		 return nil, err
-	//	 }
-	//	 blocks = append(blocks, iamBlock)
-	// }
-
 	return blocks, nil
 }
 
-// convertClusterData maps API response directly, minimal default omission
 func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluster, project, location, clusterName string, nodePools []*container.NodePool) (*models.TerraformResourceBlock, error) {
 	if cluster == nil {
 		return nil, fmt.Errorf("cluster data is nil")
 	}
 	if c.clusterSchema == nil {
+		// Cannot convert without schema, maybe return error? Or just log and return nil?
 		fmt.Printf("Warning: Cluster schema is nil in converter for %s. Cannot generate HCL.\n", clusterName)
-		return nil, nil
+		return nil, nil // Return nil block, no error to allow potential node pool conversion
 	}
 
 	hclData := make(map[string]interface{})
 
-	// --- Required & Core Fields ---
+	// Required fields
 	hclData["name"] = clusterName
-	hclData["location"] = location // Location derived from asset name
 
-	// Always include project if available
+	// Add location field - required field for cluster resource
+	hclData["location"] = location
+
+	// Optional fields - only add if non-default / non-empty
+	// Project: Omit if matches provider default (requires provider config access - skip for now)
 	if project != "" {
 		hclData["project"] = project
 	}
 
-	// --- Direct Mappings (Include if non-zero/non-empty/non-nil from API) ---
 	if cluster.Description != "" {
 		hclData["description"] = cluster.Description
 	}
 
-	// --- Heuristic: Default Node Pool Handling ---
+	// Conditional logic for initial node pool / remove_default_node_pool
+	// Check if separate node pool resources are expected based on API response structure
 	hasSeparateNodePools := false
 	if len(nodePools) > 1 || (len(nodePools) == 1 && nodePools[0] != nil && nodePools[0].Name != "default-pool") {
 		hasSeparateNodePools = true
 	}
+	// Scenario 1: Separate node pools exist or will be created
 	if hasSeparateNodePools {
-		// Explicitly set remove_default_node_pool = true if managing node pools separately
-		hclData["remove_default_node_pool"] = true
+		hclData["remove_default_node_pool"] = true // Default is false, so set true
 		// Do NOT set initial_node_count or cluster-level node_config
 	} else {
-		// Manage default pool via cluster block
-		// Set remove_default_node_pool = false (or omit, relying on TF default)
-		hclData["remove_default_node_pool"] = false // Explicitly set false
-		if cluster.InitialNodeCount > 0 {           // Keep check for > 0 as 0 might be invalid/meaningless
+		// Scenario 2: Only the default node pool exists, manage with cluster block
+		// remove_default_node_pool defaults to false, so omit it.
+		// Set initial_node_count if > 0 (default seems 3, but 0 is valid API value?)
+		if cluster.InitialNodeCount > 0 {
 			hclData["initial_node_count"] = cluster.InitialNodeCount
 		}
-		// Include node_config block if it exists in the API response
+		// Set cluster-level node_config if non-default
 		if flattened := flattenNodeConfig(cluster.NodeConfig); flattened != nil {
 			hclData["node_config"] = flattened
 		}
 	}
 
-	// --- Network Fields ---
 	if cluster.Network != "" {
 		// Use resource name or self-link based on provider preference (using name here)
 		hclData["network"] = tpgresource.GetResourceNameFromSelfLink(cluster.Network)
-		// Note: Removed comparison with "default"
 	}
 
+	// Subnetwork: Use full path for subnetwork
 	if cluster.Subnetwork != "" {
-		// Attempt to construct full path, otherwise use name/self-link
 		if project != "" && strings.HasPrefix(cluster.Subnetwork, "projects/") {
+			// If it's already a full path, use it as is
 			hclData["subnetwork"] = cluster.Subnetwork
 		} else if project != "" {
+			// Construct full path if not already present
 			subnetName := tpgresource.GetResourceNameFromSelfLink(cluster.Subnetwork)
-			region := location // Default to cluster location (might be zone or region)
+
+			// Extract region from location for subnetwork path
+			region := "us-central1" // Default in case we can't extract from location
+
+			// Extract region based on location format
+			// If location is a zone (e.g., us-central1-a), extract the region part
+			// If location is already a region (e.g., us-central1), use it directly
 			locationParts := strings.Split(location, "-")
-			if len(locationParts) >= 2 { // Basic check for region/zone format
-				// Attempt to construct region for subnetwork path (e.g., us-central1-a -> us-central1)
-				// This might still need refinement for all location types.
-				if len(locationParts) > 2 { // Likely a zone
-					region = strings.Join(locationParts[:len(locationParts)-1], "-")
+			if len(locationParts) == 3 {
+				// Location is a zone, extract region (e.g., us-central1-a -> us-central1)
+				lastDashIndex := strings.LastIndex(location, "-")
+				if lastDashIndex > 0 {
+					region = location[:lastDashIndex]
 				}
+			} else if len(locationParts) == 2 {
+				// Location is already a region (e.g., us-central1)
+				region = location
 			}
+
 			hclData["subnetwork"] = fmt.Sprintf("projects/%s/regions/%s/subnetworks/%s",
 				project,
 				region,
 				subnetName)
 		} else {
+			// Fallback to just the name if we can't construct full path
 			hclData["subnetwork"] = tpgresource.GetResourceNameFromSelfLink(cluster.Subnetwork)
 		}
 	}
 
-	// --- Nested Blocks (Flattened, Simplified) ---
-	// Call flatten functions, include the result if non-nil (meaning API object existed)
+	// IP Allocation Policy
 	if flattened := flattenIPAllocationPolicy(cluster.IpAllocationPolicy); flattened != nil {
 		hclData["ip_allocation_policy"] = flattened
 	}
 
-	// NOTE: Do NOT set "networking_mode" here. Let the TF provider infer it
-	// based on the presence/absence of "ip_allocation_policy".
-
-	// Network Config related fields
-	if cluster.NetworkConfig != nil {
-		if cluster.NetworkConfig.DatapathProvider != "" { // Include even if "unspecified" or "legacy"
-			hclData["datapath_provider"] = cluster.NetworkConfig.DatapathProvider
-		}
-		// Include boolean flags directly
-		hclData["enable_fqdn_network_policy"] = cluster.NetworkConfig.EnableFqdnNetworkPolicy
-		hclData["enable_l4_ilb_subsetting"] = cluster.NetworkConfig.EnableL4ilbSubsetting
-		hclData["enable_multi_networking"] = cluster.NetworkConfig.EnableMultiNetworking
-		// Use correct field name based on v1 API struct if different from schema
-		hclData["enable_intranode_visibility"] = cluster.NetworkConfig.EnableIntraNodeVisibility
-
-		// Nested blocks under network_config
-		if flattened := flattenDnsConfig(cluster.NetworkConfig.DnsConfig); flattened != nil {
+	// Network Config sub-fields (Datapath Provider, boolean flags)
+	if cluster.NetworkConfig != nil { // Check if NetworkConfig exists first
+		// --- Cluster Blocks (Potentially under NetworkConfig) ---
+		if flattened := flattenDnsConfig(cluster.NetworkConfig.DnsConfig); flattened != nil { // Access via NetworkConfig
 			hclData["dns_config"] = flattened
 		}
+		// Corrected field name from ServiceExternalIPsConfig to ServiceExternalIpsConfig
 		if flattened := flattenServiceExternalIPsConfig(cluster.NetworkConfig.ServiceExternalIpsConfig); flattened != nil {
 			hclData["service_external_ips_config"] = flattened
 		}
-		if flattened := flattenGatewayApiConfig(cluster.NetworkConfig.GatewayApiConfig); flattened != nil {
+		if flattened := flattenGatewayApiConfig(cluster.NetworkConfig.GatewayApiConfig); flattened != nil { // Access via NetworkConfig
 			hclData["gateway_api_config"] = flattened
+		}
+
+		// Include if "unspecified" or "legacy"
+		if cluster.NetworkConfig.DatapathProvider != "" {
+			hclData["datapath_provider"] = cluster.NetworkConfig.DatapathProvider
+		}
+		// enable_fqdn_network_policy: Omit if false (default)
+		if cluster.NetworkConfig.EnableFqdnNetworkPolicy {
+			hclData["enable_fqdn_network_policy"] = true
+		}
+		// enable_l4_ilb_subsetting: Omit if false (default)
+		if cluster.NetworkConfig.EnableL4ilbSubsetting {
+			hclData["enable_l4_ilb_subsetting"] = true
+		}
+		// enable_multi_networking: Omit if false (default)
+		if cluster.NetworkConfig.EnableMultiNetworking {
+			hclData["enable_multi_networking"] = true
+		}
+		// enable_intranode_visibility: Omit if false (default)
+		if cluster.NetworkConfig.EnableIntraNodeVisibility { // Field name from schema
+			hclData["enable_intranode_visibility"] = true
 		}
 	}
 
-	if cluster.DefaultMaxPodsConstraint != nil { // Include even if 0? Check schema if 0 is valid config. Assume yes for direct map.
+	// Default Max Pods Constraint: Omit if 0/nil (check API default)
+	if cluster.DefaultMaxPodsConstraint != nil && cluster.DefaultMaxPodsConstraint.MaxPodsPerNode > 0 {
 		hclData["default_max_pods_per_node"] = cluster.DefaultMaxPodsConstraint.MaxPodsPerNode
 	}
 
-	if flattened := flattenNetworkPolicy(cluster.NetworkPolicy); flattened != nil {
-		hclData["network_policy"] = flattened
-	}
+	// Always include network_policy, will default to disabled with PROVIDER_UNSPECIFIED if not specified
+	hclData["network_policy"] = flattenNetworkPolicy(cluster.NetworkPolicy)
 
-	// Logging / Monitoring: Include both service and config if present
 	if cluster.LoggingService != "" {
 		hclData["logging_service"] = cluster.LoggingService
 	}
@@ -293,63 +281,76 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 		hclData["monitoring_config"] = flattened
 	}
 
+	// Addons Config: omit if nil or only contains defaults
 	if flattened := flattenAddonsConfig(cluster.AddonsConfig); flattened != nil {
 		hclData["addons_config"] = flattened
 	}
 
-	// Always include node_locations if present in API
+	// Set node_locations if present in the cluster
 	if len(cluster.Locations) > 0 {
-		hclData["node_locations"] = cluster.Locations
+		zonesAndLocations := schema.NewSet(schema.HashString, tpgresource.ConvertStringArrToInterface(cluster.Locations))
+		// we shouldn't repeat zone in locations otherwise TF fails to apply for zonal cluster
+		zonesAndLocations.Remove(cluster.Zone)
+		hclData["node_locations"] = zonesAndLocations
 	}
 
-	// Always include resource_labels if present in API
+	// Resource Labels: Omit if empty
 	if len(cluster.ResourceLabels) > 0 {
 		hclData["resource_labels"] = cluster.ResourceLabels
 	}
 
-	// Release Channel / Versions
-	if flattened := flattenReleaseChannel(cluster.ReleaseChannel); flattened != nil {
-		hclData["release_channel"] = flattened
-	}
-	// Set versions directly if present, don't try to omit based on release channel
-	// Schema uses 'node_version', map from appropriate API field (e.g., CurrentNodeVersion)
-	if cluster.CurrentNodeVersion != "" { // Or another relevant field if schema maps differently
+	// Always include release_channel, will default to UNSPECIFIED if not specified
+	hclData["release_channel"] = flattenReleaseChannel(cluster.ReleaseChannel)
+
+	// Set node_version from CurrentNodeVersion (as per target schema)
+	if cluster.CurrentNodeVersion != "" {
 		hclData["node_version"] = cluster.CurrentNodeVersion
 	}
 
-	// --- Boolean Flags (Direct Mapping) ---
-	// Map directly from the API struct fields. Handle nils where necessary.
-	if cluster.Autopilot != nil {
-		hclData["enable_autopilot"] = cluster.Autopilot.Enabled
+	// master_version not included in target schema, omitting
+
+	// Boolean flags - Omit if default (usually false, check schema)
+	if cluster.Autopilot != nil && cluster.Autopilot.Enabled { // Default false
+		hclData["enable_autopilot"] = true
 	}
-	hclData["enable_kubernetes_alpha"] = cluster.EnableKubernetesAlpha
-	hclData["enable_tpu"] = cluster.EnableTpu
-	if cluster.LegacyAbac != nil {
-		hclData["enable_legacy_abac"] = cluster.LegacyAbac.Enabled
+	if cluster.EnableKubernetesAlpha { // Default false
+		hclData["enable_kubernetes_alpha"] = true
 	}
+	if cluster.EnableTpu { // Default false
+		hclData["enable_tpu"] = true
+	}
+	if cluster.LegacyAbac != nil && cluster.LegacyAbac.Enabled { // Default false
+		hclData["enable_legacy_abac"] = true
+	}
+	// this is true by default
 	if cluster.ShieldedNodes != nil {
 		hclData["enable_shielded_nodes"] = cluster.ShieldedNodes.Enabled
 	}
 
-	// --- Other Nested Blocks ---
-	if flattened := flattenMasterAuth(cluster.MasterAuth); flattened != nil {
-		hclData["master_auth"] = flattened
-	}
+	// --- Cluster Blocks --- Always include master_auth and control_plane_endpoints_config with default values
+	// Always include master_auth block with client_certificate_config.issue_client_certificate = false
+	hclData["master_auth"] = flattenMasterAuth(cluster.MasterAuth)
+
+	// Always include control_plane_endpoints_config with defaults
+	hclData["control_plane_endpoints_config"] = flattenControlPlaneEndpointsConfig(cluster.ControlPlaneEndpointsConfig)
 	if flattened := flattenPrivateClusterConfigAdapted(cluster.PrivateClusterConfig, cluster.NetworkConfig); flattened != nil {
 		hclData["private_cluster_config"] = flattened
 	}
 	if flattened := flattenClusterAutoscaling(cluster.Autoscaling); flattened != nil {
 		hclData["cluster_autoscaling"] = flattened
 	}
-	if flattened := flattenDatabaseEncryption(cluster.DatabaseEncryption); flattened != nil {
-		hclData["database_encryption"] = flattened
-	}
+	// Always include database_encryption, will default to DECRYPTED if not specified
+	hclData["database_encryption"] = flattenDatabaseEncryption(cluster.DatabaseEncryption)
+
+	// Always include enterprise_config, will default to STANDARD tier if not specified
+	hclData["enterprise_config"] = flattenEnterpriseConfig(cluster.EnterpriseConfig)
 	if flattened := flattenVerticalPodAutoscaling(cluster.VerticalPodAutoscaling); flattened != nil {
 		hclData["vertical_pod_autoscaling"] = flattened
 	}
 	if flattened := flattenBinaryAuthorization(cluster.BinaryAuthorization); flattened != nil {
 		hclData["binary_authorization"] = flattened
 	}
+	// Add Security Posture Config
 	if flattened := flattenSecurityPostureConfig(cluster.SecurityPostureConfig); flattened != nil {
 		hclData["security_posture_config"] = flattened
 	}
@@ -371,9 +372,23 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 	if flattened := flattenWorkloadIdentityConfig(cluster.WorkloadIdentityConfig); flattened != nil {
 		hclData["workload_identity_config"] = flattened
 	}
-	// flattenFleet is already omitted correctly.
+	if flattened := flattenFleet(cluster.Fleet); flattened != nil {
+		hclData["fleet"] = flattened
+	}
+	// Assuming API field name NodePoolDefaults
 	if flattened := flattenNodePoolDefaults(cluster.NodePoolDefaults); flattened != nil {
 		hclData["node_pool_defaults"] = flattened
+	}
+
+	if flattened := flattenNodePoolAutoConfig(cluster.NodePoolAutoConfig); len(flattened) > 0 && len(flattened[0]) > 0 {
+		hclData["node_pool_auto_config"] = flattened
+	}
+
+	// Check if HCL data is empty - might happen if importing a very default cluster
+	if len(hclData) <= 2 { // Only name and location were set
+		fmt.Printf("Warning: Cluster %s resulted in minimal HCL data after omitting defaults.\n", clusterName)
+		// Decide if returning nil is appropriate. It depends on whether the cluster resource itself is truly optional.
+		// For now, return the minimal block.
 	}
 
 	// Final conversion to cty.Value using the schema
@@ -388,78 +403,111 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 	}, nil
 }
 
-// convertNodePoolData maps API response directly, minimal default omission
 func (c *ContainerClusterConverter) convertNodePoolData(nodePool *container.NodePool, cluster *container.Cluster, project, location string) (*models.TerraformResourceBlock, error) {
 	if nodePool == nil {
 		return nil, fmt.Errorf("node pool data is nil")
 	}
+	// Cluster context is needed for referencing, but not strictly for node pool defaults
 	if cluster == nil {
 		return nil, fmt.Errorf("cluster context is nil for node pool")
 	}
 	if c.nodePoolSchema == nil {
+		// Cannot convert without schema
 		fmt.Printf("Warning: Node pool schema is nil in converter for %s. Cannot generate HCL.\n", nodePool.Name)
 		return nil, nil
 	}
 
 	hclData := make(map[string]interface{})
 
-	// --- Required & Core Fields ---
+	// Required fields
 	hclData["name"] = nodePool.Name
 	hclData["cluster"] = cluster.Name // Reference cluster by name
 
-	// Always include location and project if available
-	if location != "" {
+	// Optional fields - only add if non-default / non-empty
+	if location != "" { // Location is technically required by node pool resource
 		hclData["location"] = location
 	}
-	if project != "" {
+	if project != "" { // Project is technically required by node pool resource
 		hclData["project"] = project
 	}
 
-	// --- Node Count / Autoscaling ---
-	autoscalingBlock := flattenNodePoolAutoscaling(nodePool.Autoscaling) // Simplified flatten function
+	// Node count / Autoscaling - Handle initial_node_count and node_count appropriately
+	autoscalingBlock := flattenNodePoolAutoscaling(nodePool.Autoscaling)
 	if autoscalingBlock != nil {
 		hclData["autoscaling"] = autoscalingBlock
-		// Set initial_node_count if present, even with autoscaling (TF schema allows this)
-		// Note: API often returns InitialNodeCount even with autoscaling enabled.
-		hclData["initial_node_count"] = nodePool.InitialNodeCount // Map directly
+		// With autoscaling, always include initial_node_count
+		if nodePool.InitialNodeCount > 0 {
+			hclData["initial_node_count"] = nodePool.InitialNodeCount
+		} else {
+			// Default to 1 if not specified
+			hclData["initial_node_count"] = 1
+		}
 	} else {
-		// No autoscaling block, set node_count directly from InitialNodeCount
-		// Assuming InitialNodeCount reflects the desired count when autoscaling is off.
-		hclData["node_count"] = nodePool.InitialNodeCount // Map directly
+		// Autoscaling is disabled or default. Always include node_count.
+		if nodePool.InitialNodeCount > 0 {
+			hclData["node_count"] = nodePool.InitialNodeCount
+		} else {
+			// Default to 1 if not specified
+			hclData["node_count"] = 1
+		}
 	}
 
-	// --- Nested Blocks (Flattened, Simplified) ---
+	// Node Config: omit if nil or only contains defaults
 	if flattened := flattenNodeConfig(nodePool.Config); flattened != nil {
 		hclData["node_config"] = flattened
 	}
+
+	// Management: omit if nil or only contains defaults
 	if flattened := flattenNodeManagement(nodePool.Management); flattened != nil {
 		hclData["management"] = flattened
 	}
 
-	// Max Pods Constraint
-	if nodePool.MaxPodsConstraint != nil {
-		hclData["max_pods_per_node"] = nodePool.MaxPodsConstraint.MaxPodsPerNode // Map directly
+	// Set max_pods_per_node directly (not as a nested block)
+	if nodePool.MaxPodsConstraint != nil && nodePool.MaxPodsConstraint.MaxPodsPerNode > 0 {
+		hclData["max_pods_per_node"] = nodePool.MaxPodsConstraint.MaxPodsPerNode
 	}
 
+	// Network Config: omit if nil or only contains defaults
 	if flattened := flattenNodeNetworkConfig(nodePool.NetworkConfig); flattened != nil {
 		hclData["network_config"] = flattened
 	}
+
+	// Upgrade Settings: omit if nil or only contains defaults
 	if flattened := flattenNodePoolUpgradeSettings(nodePool.UpgradeSettings); flattened != nil {
 		hclData["upgrade_settings"] = flattened
 	}
 
-	// Version - map directly if present
+	// Version: Omit if empty or matches cluster version when cluster uses release channel? Complex.
+	// Simple: Omit if empty.
 	if nodePool.Version != "" {
+		// TODO: Add check against effective cluster node version if possible to omit redundancy?
 		hclData["version"] = nodePool.Version
 	}
 
+	// Placement Policy: omit if nil or only contains defaults
 	if flattened := flattenPlacementPolicy(nodePool.PlacementPolicy); flattened != nil {
 		hclData["placement_policy"] = flattened
 	}
 
-	// Node Locations - map directly if present
-	if len(nodePool.Locations) > 0 {
-		hclData["node_locations"] = nodePool.Locations
+	// This represents the zones where nodes in this pool will be created
+	if len(nodePool.Locations) > 0 || location != "" {
+		// We prefet to set the node_locations directly from cluster.Locations
+		if len(nodePool.Locations) > 0 {
+			hclData["node_locations"] = nodePool.Locations
+		} else {
+			hclData["node_locations"] = []string{location}
+		}
+	}
+
+	// Always include queued_provisioning with enabled=false as the default
+	hclData["queued_provisioning"] = flattenQueuedProvisioning(nodePool.QueuedProvisioning)
+
+	// Check if HCL data is empty (beyond required fields name, cluster, location, project)
+	if len(hclData) <= 4 {
+		fmt.Printf("Warning: Node Pool %s resulted in minimal HCL data after omitting defaults.\n", nodePool.Name)
+		// Return nil, as an empty node pool block is likely an error or redundant.
+		// return nil, nil
+		// Let's return minimal block for now, user might want explicit definition.
 	}
 
 	// Final conversion to cty.Value using the schema
@@ -474,226 +522,371 @@ func (c *ContainerClusterConverter) convertNodePoolData(nodePool *container.Node
 	}, nil
 }
 
-// --- FLATTEN FUNCTIONS (Simplified: Direct Mapping, No Default Omission) ---
+// --- FLATTEN FUNCTIONS (Revised for Default Omission) ---
 
-// flattenNodeConfig maps directly, minimal default checks.
+// flattenQueuedProvisioning creates a block for queued_provisioning with enabled=false as the default
+func flattenQueuedProvisioning(config *container.QueuedProvisioning) []interface{} {
+	qp := make(map[string]interface{})
+
+	// Always set enabled to false by default
+	qp["enabled"] = false
+
+	// If config exists and enabled is true, override the default
+	if config != nil && config.Enabled {
+		qp["enabled"] = true
+	}
+
+	return []interface{}{qp}
+}
+
+// flattenAdvancedMachineFeatures creates a block for advanced_machine_features with enable_nested_virtualization=false as the default
+func flattenAdvancedMachineFeatures(config *container.AdvancedMachineFeatures) []interface{} {
+	amf := make(map[string]interface{})
+
+	// set defaults for advanced_machine_features
+	amf["enable_nested_virtualization"] = false
+	amf["threads_per_core"] = 0
+
+	// If config exists and enable_nested_virtualization is true, override the default
+	if config != nil {
+		if config.EnableNestedVirtualization {
+			amf["enable_nested_virtualization"] = true
+		}
+		if config.ThreadsPerCore != 0 {
+			amf["threads_per_core"] = config.ThreadsPerCore
+		}
+	}
+
+	return []interface{}{amf}
+}
+
+// flattenNodeConfig now checks against defaults and returns nil if only defaults are present.
 func flattenNodeConfig(config *container.NodeConfig) []interface{} {
 	if config == nil {
-		return nil
-	}
-	nodeConfig := make(map[string]interface{})
+		// Create default node config with our required defaults
+		nodeConfig := make(map[string]interface{})
 
-	// Map fields directly if they are non-zero/non-empty/non-nil in the API response
-	if config.MachineType != "" {
-		nodeConfig["machine_type"] = config.MachineType
+		// Always include advanced_machine_features with default values
+		nodeConfig["advanced_machine_features"] = flattenAdvancedMachineFeatures(nil)
+
+		// Always include empty resource_manager_tags
+		nodeConfig["resource_manager_tags"] = make(map[string]string)
+
+		return []interface{}{nodeConfig}
 	}
+
+	nodeConfig := make(map[string]interface{})
+	hasNonDefaultConfig := false // Track if any non-default value is set
+
+	// Machine Type: Typically non-default if specified. Include if present.
+	if config.MachineType != "" {
+		// TODO: Check against implicit default like e2-medium? Hard to determine.
+		nodeConfig["machine_type"] = config.MachineType
+		hasNonDefaultConfig = true
+	}
+
 	if config.DiskSizeGb > 0 { // Keep basic check for >0, as 0 might be invalid
 		nodeConfig["disk_size_gb"] = config.DiskSizeGb
+		hasNonDefaultConfig = true
 	}
+
+	// Disk Type: Don't check on 'pd-standard' default.
 	if config.DiskType != "" {
 		nodeConfig["disk_type"] = config.DiskType
+		hasNonDefaultConfig = true
 	}
+
+	// OAuth Scopes: Omit only if list is empty (simplification, actual defaults are complex).
 	if len(config.OauthScopes) > 0 {
+		// TODO: Consider comparing against expected default scopes for the SA? Very complex.
 		nodeConfig["oauth_scopes"] = config.OauthScopes
+		hasNonDefaultConfig = true
 	}
+
+	// Service Account: dont check on "default" SA.
 	if config.ServiceAccount != "" {
-		// Map the service account name/email directly
 		nodeConfig["service_account"] = config.ServiceAccount
+		hasNonDefaultConfig = true
 	}
+
+	// Metadata: Omit if explicitly empty. GKE adds defaults, difficult to filter precisely.
 	if len(config.Metadata) > 0 {
 		nodeConfig["metadata"] = config.Metadata
+		hasNonDefaultConfig = true
 	}
+
+	// Image Type: dont check on assumed default (COS_CONTAINERD).
 	if config.ImageType != "" {
 		nodeConfig["image_type"] = config.ImageType
+		hasNonDefaultConfig = true
 	}
+
+	// Labels: Omit if empty map.
 	if len(config.Labels) > 0 {
 		nodeConfig["labels"] = config.Labels
+		hasNonDefaultConfig = true
 	}
-	if config.ResourceLabels != nil && len(config.ResourceLabels) > 0 {
+
+	// Resource Labels: Omit if empty map. (Field name might differ in v1 struct)
+	if len(config.ResourceLabels) > 0 {
 		nodeConfig["resource_labels"] = config.ResourceLabels
+		hasNonDefaultConfig = true
 	}
-	if config.LocalSsdCount > 0 { // Keep basic check for >0
+
+	// Local SSD Count: Default 0. Omit if 0.
+	if config.LocalSsdCount > 0 {
 		nodeConfig["local_ssd_count"] = config.LocalSsdCount
+		hasNonDefaultConfig = true
 	}
+
+	// Tags: Omit if empty list.
 	if len(config.Tags) > 0 {
 		nodeConfig["tags"] = config.Tags
+		hasNonDefaultConfig = true
 	}
-	// Map booleans directly
-	nodeConfig["preemptible"] = config.Preemptible
-	nodeConfig["spot"] = config.Spot
 
+	// Preemptible: Default false. Omit if false.
+	if config.Preemptible {
+		nodeConfig["preemptible"] = config.Preemptible
+		hasNonDefaultConfig = true
+	}
+
+	// Spot: Default false. Omit if false.
+	if config.Spot {
+		nodeConfig["spot"] = config.Spot
+		hasNonDefaultConfig = true
+	}
+
+	// Min CPU Platform: Default "". Omit if "".
 	if config.MinCpuPlatform != "" {
 		nodeConfig["min_cpu_platform"] = config.MinCpuPlatform
+		hasNonDefaultConfig = true
 	}
 
-	// --- Nested Blocks --- Call simplified flatteners
+	// --- Nested Blocks --- Check if flatten returns non-nil
 	if flattened := flattenWorkloadMetadataConfig(config.WorkloadMetadataConfig); flattened != nil {
 		nodeConfig["workload_metadata_config"] = flattened
+		hasNonDefaultConfig = true
 	}
 	if flattened := flattenShieldedInstanceConfig(config.ShieldedInstanceConfig); flattened != nil {
 		nodeConfig["shielded_instance_config"] = flattened
+		hasNonDefaultConfig = true
 	}
 	if flattened := flattenAccelerators(config.Accelerators); flattened != nil {
 		nodeConfig["guest_accelerator"] = flattened // TF uses guest_accelerator
+		hasNonDefaultConfig = true
 	}
 	if flattened := flattenReservationAffinity(config.ReservationAffinity); flattened != nil {
 		nodeConfig["reservation_affinity"] = flattened
+		hasNonDefaultConfig = true
 	}
 	if flattened := flattenConfidentialNodes(config.ConfidentialNodes); flattened != nil {
 		nodeConfig["confidential_nodes"] = flattened
+		hasNonDefaultConfig = true
 	}
 	if flattened := flattenKubeletConfig(config.KubeletConfig); flattened != nil {
 		nodeConfig["kubelet_config"] = flattened
+		hasNonDefaultConfig = true
 	}
 	if flattened := flattenLinuxNodeConfig(config.LinuxNodeConfig); flattened != nil {
 		nodeConfig["linux_node_config"] = flattened
+		hasNonDefaultConfig = true
 	}
-	if flattened := flattenGvnic(config.Gvnic); flattened != nil {
+	if flattened := flattenGvnic(config.Gvnic); flattened != nil { // Assuming flattenGvnic helper exists
 		nodeConfig["gvnic"] = flattened
+		hasNonDefaultConfig = true
 	}
-	// TODO: Add simplified flatten calls for other nested blocks if needed
-	// (EphemeralStorage, Nvme, SecondaryDisks, Gcfs, Windows, SoleTenant, HostMaintenance, FastSocket etc.)
 
+	// Always include advanced_machine_features with default values
+	nodeConfig["advanced_machine_features"] = flattenAdvancedMachineFeatures(config.AdvancedMachineFeatures)
+	hasNonDefaultConfig = true
+	// Add other nested blocks (EphemeralStorage, Nvme, SecondaryDisks, Gcfs, Windows, SoleTenant, HostMaintenance, FastSocket etc.)
+	// Example:
+	// if flattened := flattenEphemeralStorage(config.EphemeralStorageLocalSsdConfig); flattened != nil {
+	//  nodeConfig["ephemeral_storage_local_ssd_config"] = flattened
+	//  hasNonDefaultConfig = true
+	// }
+
+	// --- Simple Optional Fields --- Omit if zero value / empty
 	if config.BootDiskKmsKey != "" {
 		nodeConfig["boot_disk_kms_key"] = config.BootDiskKmsKey
+		hasNonDefaultConfig = true
 	}
 
-	// Taints: Use existing flatten logic which handles empty list
+	// Taints: flattenNodeTaints handles empty list.
 	if flattened := flattenNodeTaints(config.Taints); flattened != nil {
 		nodeConfig["taint"] = flattened // TF uses taint
+		hasNonDefaultConfig = true
 	}
 
-	// resource_manager_tags: Map directly if present
+	// resource_manager_tags: Always include empty map as default
 	if config.ResourceManagerTags != nil && len(config.ResourceManagerTags.Tags) > 0 {
-		nodeConfig["resource_manager_tags"] = config.ResourceManagerTags.Tags
+		nodeConfig["resource_manager_tags"] = config.ResourceManagerTags.Tags // Assign the actual map
+	} else {
+		nodeConfig["resource_manager_tags"] = make(map[string]string) // Empty map as default
+	}
+	hasNonDefaultConfig = true
+	// enable_confidential_storage: Omit if false (default)
+	if config.EnableConfidentialStorage { // Assuming field name and bool type
+		nodeConfig["enable_confidential_storage"] = true
+		hasNonDefaultConfig = true
+	}
+	// local_ssd_encryption_mode: Omit if empty or default ("STANDARD_ENCRYPTION"?)
+	localSsdEncryptDefault := "STANDARD_ENCRYPTION"                                                     // Verify
+	if config.LocalSsdEncryptionMode != "" && config.LocalSsdEncryptionMode != localSsdEncryptDefault { // Assuming field name
+		nodeConfig["local_ssd_encryption_mode"] = config.LocalSsdEncryptionMode
+		hasNonDefaultConfig = true
+	}
+	// max_run_duration: Omit if empty
+	if config.MaxRunDuration != "" { // Assuming field name
+		nodeConfig["max_run_duration"] = config.MaxRunDuration
+		hasNonDefaultConfig = true
 	}
 
-	// Map other direct fields if they exist in the v1.NodeConfig struct
-	// Ensure field names match the actual struct definition
-	// nodeConfig["enable_confidential_storage"] = config.EnableConfidentialStorage
-	// if config.LocalSsdEncryptionMode != "" { nodeConfig["local_ssd_encryption_mode"] = config.LocalSsdEncryptionMode }
-	// if config.MaxRunDuration != "" { nodeConfig["max_run_duration"] = config.MaxRunDuration }
-
-	// Return the block if the input config was not nil and the map is not empty
-	if len(nodeConfig) == 0 {
-		return nil
+	if !hasNonDefaultConfig { // If NO non-default values were added
+		return nil // Omit the entire node_config block
 	}
 	return []interface{}{nodeConfig}
 }
 
-// flattenWorkloadMetadataConfig: Simplified direct mapping
+// flattenWorkloadMetadataConfig: map directly, do not check against defaultWlcMode or "MODE_UNSPECIFIED"
 func flattenWorkloadMetadataConfig(config *container.WorkloadMetadataConfig) []interface{} {
-	if config == nil {
-		return nil
-	}
-	// Map directly, do not check against defaultWlcMode or "MODE_UNSPECIFIED"
-	if config.Mode == "" { // Only omit if mode is genuinely empty string
+	if config == nil || config.Mode == "" {
 		return nil
 	}
 	return []interface{}{map[string]interface{}{"mode": config.Mode}}
 }
 
-// flattenShieldedInstanceConfig: Simplified direct mapping
+// flattenShieldedInstanceConfig: Omit fields if they match defaults, nil if block becomes empty.
 func flattenShieldedInstanceConfig(config *container.ShieldedInstanceConfig) []interface{} {
 	if config == nil {
 		return nil
 	}
 	sic := make(map[string]interface{})
-	// Map booleans directly, do not check against defaults
-	sic["enable_secure_boot"] = config.EnableSecureBoot
-	sic["enable_integrity_monitoring"] = config.EnableIntegrityMonitoring
+	hasNonDefaultConfig := false
 
-	// Only return block if input config was not nil
+	// Default enable_secure_boot: false
+	if config.EnableSecureBoot {
+		sic["enable_secure_boot"] = true
+		hasNonDefaultConfig = true
+	}
+	// Default enable_integrity_monitoring: true
+	if !config.EnableIntegrityMonitoring { // Only include if explicitly false (non-default)
+		sic["enable_integrity_monitoring"] = false
+		hasNonDefaultConfig = true
+	}
+
+	if !hasNonDefaultConfig {
+		return nil // Block only contained defaults
+	}
 	return []interface{}{sic}
 }
 
-// flattenAccelerators: Simplified direct mapping
+// flattenAccelerators: Omit if list empty. Checks internal defaults.
 func flattenAccelerators(accelerators []*container.AcceleratorConfig) []interface{} {
 	if len(accelerators) == 0 {
 		return nil
 	}
 	result := make([]interface{}, 0, len(accelerators))
+	hasMeaningfulAccelerator := false
+
 	for _, acc := range accelerators {
 		if acc == nil {
 			continue
 		}
+
 		data := make(map[string]interface{})
-		// Map required fields directly
+		accHasNonDefaultConfig := false
+
+		// Count and Type are required by schema if block present. Always include if acc exists.
+		// Assuming keys match the map structure expected by the caller (flattenNodeConfig -> guest_accelerator)
 		data["accelerator_type"] = acc.AcceleratorType
 		data["accelerator_count"] = acc.AcceleratorCount
-		// Map optional fields directly if present
+		accHasNonDefaultConfig = true // Presence of type/count makes it non-default
+
+		// Optional fields - add only if present AND potentially non-default
 		if acc.GpuPartitionSize != "" {
 			data["gpu_partition_size"] = acc.GpuPartitionSize
+			accHasNonDefaultConfig = true
 		}
-		// Call simplified nested flatteners
 		if flattened := flattenGpuSharingConfig(acc.GpuSharingConfig); flattened != nil {
 			data["gpu_sharing_config"] = flattened
+			accHasNonDefaultConfig = true
 		}
 		if flattened := flattenGpuDriverInstallationConfig(acc.GpuDriverInstallationConfig); flattened != nil {
 			data["gpu_driver_installation_config"] = flattened
+			accHasNonDefaultConfig = true
 		}
-		result = append(result, data)
+
+		if accHasNonDefaultConfig { // Should always be true if acc != nil due to type/count
+			result = append(result, data)
+			hasMeaningfulAccelerator = true
+		}
 	}
-	if len(result) == 0 { // Possible if all acc were nil
+
+	if !hasMeaningfulAccelerator { // If all acc were nil or somehow deemed default
 		return nil
 	}
 	return result
 }
 
-// flattenGpuSharingConfig: Simplified direct mapping
+// flattenGpuSharingConfig: Omit fields if default. Return nil if block empty/default.
 func flattenGpuSharingConfig(config *container.GPUSharingConfig) []interface{} {
 	if config == nil {
 		return nil
 	}
 	data := make(map[string]interface{})
-	// Map fields directly, do not check against defaults or "UNSPECIFIED"
-	if config.MaxSharedClientsPerGpu > 0 { // Keep basic check > 0
+	hasNonDefaultConfig := false
+
+	// Max clients required by schema if block present
+	if config.MaxSharedClientsPerGpu > 0 { // Assume 0 is default/invalid? Schema needs check. Let's include if > 0.
 		data["max_shared_clients_per_gpu"] = config.MaxSharedClientsPerGpu
+		hasNonDefaultConfig = true
+	} else {
+		// If max_shared_clients is required and <= 0, maybe the block is invalid?
+		// For now, let's assume the block can exist without it if strategy is set.
 	}
-	if config.GpuSharingStrategy != "" {
+
+	// Strategy: Omit if default (UNSPECIFIED)
+	if config.GpuSharingStrategy != "" && config.GpuSharingStrategy != "GPU_SHARING_STRATEGY_UNSPECIFIED" {
 		data["gpu_sharing_strategy"] = config.GpuSharingStrategy
+		hasNonDefaultConfig = true
 	}
-	if len(data) == 0 { // Return nil if neither field was set meaningfully
-		return nil
+
+	if !hasNonDefaultConfig {
+		return nil // Only contained defaults or was invalid
 	}
 	return []interface{}{data}
 }
 
-// flattenGpuDriverInstallationConfig: Simplified direct mapping
 func flattenGpuDriverInstallationConfig(config *container.GPUDriverInstallationConfig) []interface{} {
-	if config == nil {
+	// Map directly, do not check against "UNSPECIFIED"
+	if config == nil || config.GpuDriverVersion == "" {
 		return nil
 	}
-	// Map directly, do not check against "UNSPECIFIED"
-	if config.GpuDriverVersion == "" {
-		return nil // Omit only if empty string
-	}
+	// Version is required by schema if block present, and we've established it's non-default here.
 	return []interface{}{map[string]interface{}{"gpu_driver_version": config.GpuDriverVersion}}
 }
 
-// flattenReservationAffinity: Simplified direct mapping, but keep logic for SPECIFIC_RESERVATION
 func flattenReservationAffinity(config *container.ReservationAffinity) []interface{} {
 	if config == nil {
 		return nil
 	}
-	// Map type directly, do not check against defaultReservationType or "UNSPECIFIED"
+	// Map type directly, do not check against "NO_RESERVATION" or "UNSPECIFIED"
 	if config.ConsumeReservationType == "" {
-		return nil // Omit only if empty
+		return nil // Omit block if type is default/unspecified
 	}
 
 	ra := make(map[string]interface{})
-	ra["consume_reservation_type"] = config.ConsumeReservationType
+	ra["consume_reservation_type"] = config.ConsumeReservationType // Set non-default type
 
-	// Keep logic specific to SPECIFIC_RESERVATION as it requires key/values
 	if config.ConsumeReservationType == "SPECIFIC_RESERVATION" {
 		if config.Key != "" {
 			ra["key"] = config.Key
 		} else {
-			// Warning remains valid if type is SPECIFIC but key missing
 			fmt.Printf("Warning: ReservationAffinity type is SPECIFIC_RESERVATION but Key is missing. Omitting block.\n")
 			return nil
 		}
-		// Map values directly if present
 		if len(config.Values) > 0 {
 			ra["values"] = config.Values
 		}
@@ -701,64 +894,83 @@ func flattenReservationAffinity(config *container.ReservationAffinity) []interfa
 	return []interface{}{ra}
 }
 
-// flattenConfidentialNodes: Simplified direct mapping
+// flattenConfidentialNodes: Omit if default (enabled: false).
 func flattenConfidentialNodes(config *container.ConfidentialNodes) []interface{} {
-	if config == nil {
+	if config == nil || !config.Enabled { // Default is false
 		return nil
 	}
-	// Map directly, do not omit if false (default)
-	return []interface{}{map[string]interface{}{"enabled": config.Enabled}}
+	return []interface{}{map[string]interface{}{"enabled": true}}
 }
 
-// flattenKubeletConfig: Simplified direct mapping
+// flattenKubeletConfig: Omit fields matching defaults, return nil if block becomes empty.
 func flattenKubeletConfig(config *container.NodeKubeletConfig) []interface{} {
 	if config == nil {
 		return nil
 	}
 	kc := make(map[string]interface{})
-	// Map fields directly if present/non-zero/non-default-zero-value
-	kc["insecure_kubelet_readonly_port_enabled"] = config.InsecureKubeletReadonlyPortEnabled
+	hasNonDefaultConfig := false
 
+	// Add insecure_kubelet_readonly_port_enabled if true
+	if config.InsecureKubeletReadonlyPortEnabled {
+		kc["insecure_kubelet_readonly_port_enabled"] = flattenInsecureKubeletReadonlyPortEnabled(config)
+		hasNonDefaultConfig = true
+	}
+
+	// dont check for "none"
 	if config.CpuManagerPolicy != "" {
-		kc["cpu_manager_policy"] = config.CpuManagerPolicy // Do not check against defaultKubeletCpuPolicy
+		kc["cpu_manager_policy"] = config.CpuManagerPolicy
+		hasNonDefaultConfig = true
 	}
-	kc["cpu_cfs_quota"] = config.CpuCfsQuota
-	if config.CpuCfsQuotaPeriod != "" {
-		kc["cpu_cfs_quota_period"] = config.CpuCfsQuotaPeriod
-	}
-	if config.PodPidsLimit != 0 {
-		kc["pod_pids_limit"] = config.PodPidsLimit
-	}
-	// TODO: Add direct mapping for container log/image GC fields if needed
 
-	if len(kc) == 0 {
+	// Assuming CpuCfsQuota field is bool in v1 API struct
+	if config.CpuCfsQuota { // Default is false
+		kc["cpu_cfs_quota"] = config.CpuCfsQuota
+		hasNonDefaultConfig = true
+	}
+	if config.CpuCfsQuotaPeriod != "" { // Default is ""
+		kc["cpu_cfs_quota_period"] = config.CpuCfsQuotaPeriod
+		hasNonDefaultConfig = true
+	}
+	if config.PodPidsLimit != 0 { // Default is 0 / unset
+		kc["pod_pids_limit"] = config.PodPidsLimit
+		hasNonDefaultConfig = true
+	}
+
+	// TODO: Add checks for container log/image GC fields against their defaults if known
+
+	if !hasNonDefaultConfig {
 		return nil
 	}
 	return []interface{}{kc}
 }
 
-// flattenLinuxNodeConfig: Simplified direct mapping
+// flattenLinuxNodeConfig: Omit fields matching defaults, return nil if block becomes empty.
 func flattenLinuxNodeConfig(config *container.LinuxNodeConfig) []interface{} {
 	if config == nil {
 		return nil
 	}
 	lnc := make(map[string]interface{})
-	// Map directly if present/non-empty
-	if config.Sysctls != nil && len(config.Sysctls) > 0 {
-		lnc["sysctls"] = config.Sysctls
-	}
-	if config.CgroupMode != "" { // Do not check against defaultLinuxCgroupMode or "UNSPECIFIED"
-		lnc["cgroup_mode"] = config.CgroupMode
-	}
-	// TODO: Add direct mapping for hugepages_config if needed
+	hasNonDefaultConfig := false
 
-	if len(lnc) == 0 {
+	// Default sysctls: nil/empty map
+	if len(config.Sysctls) > 0 {
+		lnc["sysctls"] = config.Sysctls
+		hasNonDefaultConfig = true
+	}
+	// Do not check against "GROUP_MODE_V1" or "UNSPECIFIED"
+	if config.CgroupMode != "" {
+		lnc["cgroup_mode"] = config.CgroupMode
+		hasNonDefaultConfig = true
+	}
+	// TODO: Check hugepages_config against default (likely all 0)
+
+	if !hasNonDefaultConfig {
 		return nil
 	}
 	return []interface{}{lnc}
 }
 
-// flattenNodeTaints: Keep existing logic - already filters empty/invalid effect
+// flattenNodeTaints: Already handles empty list and invalid effect. No change needed.
 func flattenNodeTaints(taints []*container.NodeTaint) []interface{} {
 	if len(taints) == 0 {
 		return nil
@@ -768,9 +980,9 @@ func flattenNodeTaints(taints []*container.NodeTaint) []interface{} {
 		if taint == nil {
 			continue
 		}
-		// Keep check for invalid effect
 		if taint.Effect == "" || taint.Effect == "EFFECT_UNSPECIFIED" {
-			continue
+			// fmt.Printf("Warning: Skipping taint with key %s due to unspecified effect.\n", taint.Key)
+			continue // Skip invalid/default effect
 		}
 		t := make(map[string]interface{})
 		t["key"] = taint.Key
@@ -784,335 +996,410 @@ func flattenNodeTaints(taints []*container.NodeTaint) []interface{} {
 	return result
 }
 
-// flattenGvnic: Simplified direct mapping
+// flattenGvnic: Omit if default (enabled: false).
 func flattenGvnic(config *container.VirtualNIC) []interface{} {
-	if config == nil {
+	if config == nil || !config.Enabled { // Default enabled: false
 		return nil
 	}
-	// Map directly, do not omit if false (default)
-	return []interface{}{map[string]interface{}{"enabled": config.Enabled}}
+	return []interface{}{map[string]interface{}{"enabled": true}}
 }
 
-// flattenIPAllocationPolicy: Simplified direct mapping
+// flattenIPAllocationPolicy: Omit fields if default, return nil if block becomes empty.
 func flattenIPAllocationPolicy(policy *container.IPAllocationPolicy) []interface{} {
 	if policy == nil {
 		return nil
 	}
 	ipa := make(map[string]interface{})
-	// Map fields directly if non-empty / non-zero / non-default-zero-value
-	if policy.ClusterSecondaryRangeName != "" {
-		ipa["cluster_secondary_range_name"] = policy.ClusterSecondaryRangeName
-	}
-	if policy.ServicesSecondaryRangeName != "" {
-		ipa["services_secondary_range_name"] = policy.ServicesSecondaryRangeName
-	}
+	hasNonDefaultConfig := false
+
+	// cluster_secondary_range_name conflicts with cluster_ipv4_cidr_block. we prefer to set cluster_ipv4_cidr_block
 	if policy.ClusterIpv4CidrBlock != "" {
 		ipa["cluster_ipv4_cidr_block"] = policy.ClusterIpv4CidrBlock
+		hasNonDefaultConfig = true
 	}
+	if policy.ClusterIpv4CidrBlock == "" && policy.ClusterSecondaryRangeName != "" {
+		ipa["cluster_secondary_range_name"] = policy.ClusterSecondaryRangeName
+		hasNonDefaultConfig = true
+	}
+	// services_secondary_range_name conflicts with services_ipv4_cidr_block. we prefer to set services_ipv4_cidr_block
 	if policy.ServicesIpv4CidrBlock != "" {
 		ipa["services_ipv4_cidr_block"] = policy.ServicesIpv4CidrBlock
+		hasNonDefaultConfig = true
 	}
-	// Map booleans directly
-	ipa["create_subnetwork"] = policy.CreateSubnetwork
+	if policy.ServicesIpv4CidrBlock == "" && policy.ServicesSecondaryRangeName != "" {
+		ipa["services_secondary_range_name"] = policy.ServicesSecondaryRangeName
+		hasNonDefaultConfig = true
+	}
+	if policy.CreateSubnetwork { // Default false
+		ipa["create_subnetwork"] = policy.CreateSubnetwork
+		hasNonDefaultConfig = true
+	}
 	if policy.SubnetworkName != "" {
 		ipa["subnetwork_name"] = policy.SubnetworkName
+		hasNonDefaultConfig = true
 	}
 	if policy.TpuIpv4CidrBlock != "" {
 		ipa["tpu_ipv4_cidr_block"] = policy.TpuIpv4CidrBlock
+		hasNonDefaultConfig = true
 	}
 	// Map StackType directly, do not check against default or "UNSPECIFIED"
 	if policy.StackType != "" {
 		ipa["stack_type"] = policy.StackType
+		hasNonDefaultConfig = true
 	}
-	// Map nested blocks directly if present
+	// Additional Pod Ranges: Omit if nil/empty
 	if policy.AdditionalPodRangesConfig != nil && len(policy.AdditionalPodRangesConfig.PodRangeNames) > 0 {
 		addlConfig := map[string]interface{}{"pod_range_names": policy.AdditionalPodRangesConfig.PodRangeNames}
 		ipa["additional_pod_ranges_config"] = []interface{}{addlConfig}
+		hasNonDefaultConfig = true
 	}
-	if policy.PodCidrOverprovisionConfig != nil {
+	// Pod CIDR Overprovisioning: Omit if nil or disabled:false (default)
+	if policy.PodCidrOverprovisionConfig != nil && policy.PodCidrOverprovisionConfig.Disable { // Only include if true (non-default)
 		overprovisionConfig := map[string]interface{}{"disable": policy.PodCidrOverprovisionConfig.Disable}
 		ipa["pod_cidr_overprovision_config"] = []interface{}{overprovisionConfig}
+		hasNonDefaultConfig = true
 	}
 
-	// Return block if input policy was not nil (even if empty, presence implies VPC-native)
+	if !hasNonDefaultConfig {
+		// If the policy object exists, IP Aliases are implicitly used.
+		// The presence of the block itself enables VPC_NATIVE mode.
+		// Return nil if no actual config values are set beyond defaults.
+		return nil
+	}
 	return []interface{}{ipa}
 }
 
-// flattenAddonsConfig: Simplified direct mapping
+// flattenAddonsConfig: Omit addons if they match their specific defaults. Nil if block empty.
 func flattenAddonsConfig(config *container.AddonsConfig) []interface{} {
 	if config == nil {
 		return nil
 	}
-	addons := make(map[string]interface{})
 
-	// For each addon, if the config object exists in API, create the HCL block and map directly
-	if config.HttpLoadBalancing != nil {
-		addons["http_load_balancing"] = []interface{}{map[string]interface{}{
-			"disabled": config.HttpLoadBalancing.Disabled,
-		}}
+	addons := make(map[string]interface{})
+	hasNonDefaultConfig := false
+
+	// HTTP Load Balancing: Default enabled (disabled: false)
+	if config.HttpLoadBalancing != nil && config.HttpLoadBalancing.Disabled { // Include only if explicitly disabled
+		addons["http_load_balancing"] = []interface{}{map[string]interface{}{"disabled": true}}
+		hasNonDefaultConfig = true
 	}
-	if config.HorizontalPodAutoscaling != nil {
-		addons["horizontal_pod_autoscaling"] = []interface{}{map[string]interface{}{
-			"disabled": config.HorizontalPodAutoscaling.Disabled,
-		}}
+	// Horizontal Pod Autoscaling: Default enabled (disabled: false)
+	if config.HorizontalPodAutoscaling != nil && config.HorizontalPodAutoscaling.Disabled { // Include only if explicitly disabled
+		addons["horizontal_pod_autoscaling"] = []interface{}{map[string]interface{}{"disabled": true}}
+		hasNonDefaultConfig = true
 	}
-	if config.NetworkPolicyConfig != nil {
-		addons["network_policy_config"] = []interface{}{map[string]interface{}{
-			"disabled": config.NetworkPolicyConfig.Disabled,
-		}}
+	// Network Policy Config: Default disabled (disabled: true)
+	if config.NetworkPolicyConfig != nil && !config.NetworkPolicyConfig.Disabled { // Include only if explicitly enabled
+		addons["network_policy_config"] = []interface{}{map[string]interface{}{"disabled": false}}
+		hasNonDefaultConfig = true
 	}
-	if config.CloudRunConfig != nil {
-		crc := map[string]interface{}{"disabled": config.CloudRunConfig.Disabled}
-		if config.CloudRunConfig.LoadBalancerType != "" {
+	// CloudRun Config: Default disabled (disabled: true)
+	if config.CloudRunConfig != nil && !config.CloudRunConfig.Disabled { // Include only if explicitly enabled
+		crc := map[string]interface{}{"disabled": false}
+		// load_balancer_type default is external, only set if internal (non-default)
+		if config.CloudRunConfig.LoadBalancerType == "LOAD_BALANCER_TYPE_INTERNAL" {
 			crc["load_balancer_type"] = config.CloudRunConfig.LoadBalancerType
 		}
 		addons["cloudrun_config"] = []interface{}{crc}
+		hasNonDefaultConfig = true
 	}
-	if config.DnsCacheConfig != nil {
-		addons["dns_cache_config"] = []interface{}{map[string]interface{}{
-			"enabled": config.DnsCacheConfig.Enabled,
-		}}
+	// DnsCache Config: Default disabled (enabled: false)
+	if config.DnsCacheConfig != nil && config.DnsCacheConfig.Enabled { // Include only if explicitly enabled
+		addons["dns_cache_config"] = []interface{}{map[string]interface{}{"enabled": true}}
+		hasNonDefaultConfig = true
 	}
-	if config.GcePersistentDiskCsiDriverConfig != nil {
-		addons["gce_persistent_disk_csi_driver_config"] = []interface{}{map[string]interface{}{
-			"enabled": config.GcePersistentDiskCsiDriverConfig.Enabled,
-		}}
+	// GCE Persistent Disk CSI Driver: Default depends on version (often enabled). Assume TF default=enabled. Include only if explicitly disabled.
+	if config.GcePersistentDiskCsiDriverConfig != nil && !config.GcePersistentDiskCsiDriverConfig.Enabled {
+		addons["gce_persistent_disk_csi_driver_config"] = []interface{}{map[string]interface{}{"enabled": false}}
+		hasNonDefaultConfig = true
 	}
-	if config.GcpFilestoreCsiDriverConfig != nil {
-		addons["gcp_filestore_csi_driver_config"] = []interface{}{map[string]interface{}{
-			"enabled": config.GcpFilestoreCsiDriverConfig.Enabled,
-		}}
+	// GCP Filestore CSI Driver: Default disabled. Include only if explicitly enabled.
+	if config.GcpFilestoreCsiDriverConfig != nil && config.GcpFilestoreCsiDriverConfig.Enabled {
+		addons["gcp_filestore_csi_driver_config"] = []interface{}{map[string]interface{}{"enabled": true}}
+		hasNonDefaultConfig = true
 	}
-	if config.ConfigConnectorConfig != nil {
-		addons["config_connector_config"] = []interface{}{map[string]interface{}{
-			"enabled": config.ConfigConnectorConfig.Enabled,
-		}}
+	// Config Connector Config: Default disabled. Include only if explicitly enabled.
+	if config.ConfigConnectorConfig != nil && config.ConfigConnectorConfig.Enabled {
+		addons["config_connector_config"] = []interface{}{map[string]interface{}{"enabled": true}}
+		hasNonDefaultConfig = true
 	}
-	if config.GkeBackupAgentConfig != nil {
-		addons["gke_backup_agent_config"] = []interface{}{map[string]interface{}{
-			"enabled": config.GkeBackupAgentConfig.Enabled,
-		}}
+	// GKE Backup Agent Config: Default disabled. Include only if explicitly enabled.
+	if config.GkeBackupAgentConfig != nil && config.GkeBackupAgentConfig.Enabled {
+		addons["gke_backup_agent_config"] = []interface{}{map[string]interface{}{"enabled": true}}
+		hasNonDefaultConfig = true
 	}
-	if config.GcsFuseCsiDriverConfig != nil {
-		addons["gcs_fuse_csi_driver_config"] = []interface{}{map[string]interface{}{
-			"enabled": config.GcsFuseCsiDriverConfig.Enabled,
-		}}
+	// GCS Fuse CSI Driver Config: Default disabled. Include only if explicitly enabled.
+	if config.GcsFuseCsiDriverConfig != nil && config.GcsFuseCsiDriverConfig.Enabled {
+		addons["gcs_fuse_csi_driver_config"] = []interface{}{map[string]interface{}{"enabled": true}}
+		hasNonDefaultConfig = true
 	}
-	if config.StatefulHaConfig != nil {
-		addons["stateful_ha_config"] = []interface{}{map[string]interface{}{
-			"enabled": config.StatefulHaConfig.Enabled,
-		}}
+	// Stateful HA Config: Default disabled. Include only if explicitly enabled.
+	if config.StatefulHaConfig != nil && config.StatefulHaConfig.Enabled {
+		addons["stateful_ha_config"] = []interface{}{map[string]interface{}{"enabled": true}}
+		hasNonDefaultConfig = true
 	}
-	if config.RayOperatorConfig != nil {
-		rayConfig := map[string]interface{}{"enabled": config.RayOperatorConfig.Enabled}
-		if config.RayOperatorConfig.RayClusterLoggingConfig != nil {
-			rayConfig["ray_cluster_logging_config"] = []interface{}{map[string]interface{}{
-				"enabled": config.RayOperatorConfig.RayClusterLoggingConfig.Enabled,
-			}}
+	// Ray Operator Config: Default disabled. Include only if explicitly enabled. Check internal defaults too.
+	if config.RayOperatorConfig != nil && config.RayOperatorConfig.Enabled {
+		rayConfig := map[string]interface{}{"enabled": true}
+		raySubConfigHasNonDefault := false
+		// Ray Logging: Default disabled. Add block only if enabled.
+		if config.RayOperatorConfig.RayClusterLoggingConfig != nil && config.RayOperatorConfig.RayClusterLoggingConfig.Enabled {
+			rayConfig["ray_cluster_logging_config"] = []interface{}{map[string]interface{}{"enabled": true}}
+			raySubConfigHasNonDefault = true
 		}
-		if config.RayOperatorConfig.RayClusterMonitoringConfig != nil {
-			rayConfig["ray_cluster_monitoring_config"] = []interface{}{map[string]interface{}{
-				"enabled": config.RayOperatorConfig.RayClusterMonitoringConfig.Enabled,
-			}}
+		// Ray Monitoring: Default disabled. Add block only if enabled.
+		if config.RayOperatorConfig.RayClusterMonitoringConfig != nil && config.RayOperatorConfig.RayClusterMonitoringConfig.Enabled {
+			rayConfig["ray_cluster_monitoring_config"] = []interface{}{map[string]interface{}{"enabled": true}}
+			raySubConfigHasNonDefault = true
 		}
-		addons["ray_operator_config"] = []interface{}{rayConfig}
+		// Only add ray_operator_config if the main addon or sub-configs are enabled
+		if config.RayOperatorConfig.Enabled || raySubConfigHasNonDefault {
+			addons["ray_operator_config"] = []interface{}{rayConfig}
+			hasNonDefaultConfig = true
+		}
 	}
-	if config.ParallelstoreCsiDriverConfig != nil {
-		addons["parallelstore_csi_driver_config"] = []interface{}{map[string]interface{}{
-			"enabled": config.ParallelstoreCsiDriverConfig.Enabled,
-		}}
+	// Parallelstore CSI Driver Config: Default disabled. Include only if explicitly enabled.
+	if config.ParallelstoreCsiDriverConfig != nil && config.ParallelstoreCsiDriverConfig.Enabled {
+		addons["parallelstore_csi_driver_config"] = []interface{}{map[string]interface{}{"enabled": true}}
+		hasNonDefaultConfig = true
 	}
 
-	if len(addons) == 0 {
-		return nil
+	if !hasNonDefaultConfig {
+		return nil // Omit block if only defaults were found
 	}
 	return []interface{}{addons}
 }
 
-// flattenNetworkPolicy: Simplified direct mapping
+// flattenNetworkPolicy: Omit if nil or disabled (default). Check provider default.
 func flattenNetworkPolicy(policy *container.NetworkPolicy) []interface{} {
-	if policy == nil {
-		return nil
-	}
+	// Create data map for network policy
 	data := make(map[string]interface{})
-	// Map directly, do not omit block if enabled=false
-	data["enabled"] = policy.Enabled
-	// Map provider directly if present, do not check against default or "UNSPECIFIED"
+
+	// If policy is nil or not enabled, return default values
+	if policy == nil || !policy.Enabled {
+		data["enabled"] = false
+		data["provider"] = "PROVIDER_UNSPECIFIED"
+		return []interface{}{data}
+	}
+
+	// Policy is enabled
+	data["enabled"] = true
+
+	// Set provider, default to PROVIDER_UNSPECIFIED if not set
 	if policy.Provider != "" {
 		data["provider"] = policy.Provider
+	} else {
+		data["provider"] = "PROVIDER_UNSPECIFIED"
 	}
-	// Return block if input policy was not nil
+
 	return []interface{}{data}
 }
 
-// flattenNodePoolAutoscaling: Simplified direct mapping
+// flattenNodePoolAutoscaling: Omit fields if default. Block required if autoscaling enabled.
 func flattenNodePoolAutoscaling(autoscaling *container.NodePoolAutoscaling) []interface{} {
-	if autoscaling == nil {
+	// Gated by autoscaling.Enabled check in caller (convertNodePoolData)
+	if autoscaling == nil || !autoscaling.Enabled {
+		// This function shouldn't be called if not enabled, but double-check
 		return nil
 	}
-	// If autoscaling is explicitly disabled in the API object, omit the block
-	// This assumes TF provider handles node_count correctly when autoscaling block absent.
-	if !autoscaling.Enabled {
-		return nil
-	}
-
 	data := make(map[string]interface{})
-	// Map required fields directly (assuming Enabled=true here)
+	// REMOVED: hasNonDefaultConfig := false // Unused
+
+	// Min/Max count are required if block present
 	data["min_node_count"] = autoscaling.MinNodeCount
 	data["max_node_count"] = autoscaling.MaxNodeCount
+	// REMOVED: hasNonDefaultConfig = true // Unused
 
-	// Map optional fields directly if present/non-zero
+	// Total counts: Omit if 0 (default)
 	if autoscaling.TotalMinNodeCount > 0 {
 		data["total_min_node_count"] = autoscaling.TotalMinNodeCount
+		// REMOVED: hasNonDefaultConfig = true // Unused
 	}
 	if autoscaling.TotalMaxNodeCount > 0 {
 		data["total_max_node_count"] = autoscaling.TotalMaxNodeCount
+		// REMOVED: hasNonDefaultConfig = true // Unused
 	}
-	// Map location policy directly, do not check against default
-	if autoscaling.LocationPolicy != "" {
+	// Location policy: Omit if default (UNSPECIFIED)
+	if autoscaling.LocationPolicy != "" && autoscaling.LocationPolicy != "LOCATION_POLICY_UNSPECIFIED" {
 		data["location_policy"] = autoscaling.LocationPolicy
+		// REMOVED: hasNonDefaultConfig = true // Unused
 	}
-	// Map Autoscaling Profile directly if exists and non-empty in API struct
-	// Assuming field name is AutoscalingProfile in v1 struct
-	// if autoscaling.AutoscalingProfile != "" {
-	//	 data["autoscaling_profile"] = autoscaling.AutoscalingProfile
-	// }
+	// Autoscaling profile section remains commented out as before
 
-	// Always return block if Enabled=true in API
+	// Since min/max are required, the block is always returned if called.
 	return []interface{}{data}
 }
 
-// flattenNodeManagement: Simplified direct mapping
+// flattenNodeManagement: Omit fields if default. Check defaults (TF schema likely computes true?).
 func flattenNodeManagement(mgmt *container.NodeManagement) []interface{} {
 	if mgmt == nil {
 		return nil
 	}
+
 	data := make(map[string]interface{})
-	// Map directly, do not assume true defaults and omit only if false
-	data["auto_repair"] = mgmt.AutoRepair
-	data["auto_upgrade"] = mgmt.AutoUpgrade
+	hasNonDefaultConfig := false
+
+	// Schema: Optional=true, Computed=true. What's the computed default? Often true for repair/upgrade.
+	// Assume provider computes true if omitted. Only set if explicitly false.
+	if !mgmt.AutoRepair {
+		data["auto_repair"] = false
+		hasNonDefaultConfig = true
+	}
+	if !mgmt.AutoUpgrade {
+		data["auto_upgrade"] = false
+		hasNonDefaultConfig = true
+	}
 
 	// mgmt.UpgradeOptions is output-only, skip.
 
-	// Return block if input mgmt was not nil
+	if !hasNonDefaultConfig {
+		return nil
+	} // Omit block if both are default (true)
 	return []interface{}{data}
 }
 
-// flattenNodePoolUpgradeSettings: Simplified direct mapping
+// flattenNodePoolUpgradeSettings: Omit fields if default. Check max_surge/unavailable defaults (often 1/0?).
 func flattenNodePoolUpgradeSettings(settings *container.UpgradeSettings) []interface{} {
 	if settings == nil {
 		return nil
 	}
-	data := make(map[string]interface{})
-	// Map fields directly, do not check against defaults (1, 0, "SURGE")
-	data["max_surge"] = settings.MaxSurge             // Map even if 0 or 1
-	data["max_unavailable"] = settings.MaxUnavailable // Map even if 0 or 1
 
-	if settings.Strategy != "" { // Map directly, don't check against default or "UNSPECIFIED"
-		data["strategy"] = settings.Strategy
+	data := make(map[string]interface{})
+	hasNonDefaultConfig := false
+
+	// Check max_surge default (often 1?). Omit if matches.
+	maxSurgeDefault := int64(1) // Verify this default
+	if settings.MaxSurge != maxSurgeDefault {
+		data["max_surge"] = settings.MaxSurge
+		hasNonDefaultConfig = true
 	}
-	// Call simplified nested flattener
+	// Check max_unavailable default (often 0?). Omit if matches.
+	maxUnavailableDefault := int64(0) // Verify this default
+	if settings.MaxUnavailable != maxUnavailableDefault {
+		data["max_unavailable"] = settings.MaxUnavailable
+		hasNonDefaultConfig = true
+	}
+
+	// Strategy: Omit if default (UNSPECIFIED or SURGE?). Assume SURGE is often default if unspecified. Check provider.
+	strategyDefault := "SURGE" // Verify this default
+	if settings.Strategy != "" && settings.Strategy != "NODE_POOL_UPDATE_STRATEGY_UNSPECIFIED" && settings.Strategy != strategyDefault {
+		data["strategy"] = settings.Strategy
+		hasNonDefaultConfig = true
+	}
+	// BlueGreenSettings: Omit if nil or default.
 	if flattened := flattenBlueGreenSettings(settings.BlueGreenSettings); flattened != nil {
 		data["blue_green_settings"] = flattened
+		hasNonDefaultConfig = true
 	}
 
-	// Return nil only if map is empty AND blueGreen was also nil
-	// This avoids returning an empty block like `upgrade_settings {}` if nothing was configured.
-	if len(data) == 0 && settings.BlueGreenSettings == nil {
+	if !hasNonDefaultConfig {
 		return nil
-	}
+	} // Omit if only defaults found
 	return []interface{}{data}
 }
 
-// flattenBlueGreenSettings: Simplified, keep required field logic
+// flattenBlueGreenSettings: Omit fields if default. Check soak duration default ("0s").
 func flattenBlueGreenSettings(settings *container.BlueGreenSettings) []interface{} {
 	if settings == nil {
 		return nil
 	}
-	// Keep check for required StandardRolloutPolicy
+
+	// StandardRolloutPolicy is required if blue_green_settings block exists in TF.
 	if settings.StandardRolloutPolicy == nil {
 		fmt.Println("Warning: BlueGreenSettings present but StandardRolloutPolicy block is missing. Omitting BlueGreen block.")
 		return nil
 	}
 
 	data := make(map[string]interface{})
+	hasNonDefaultConfig := false // Track non-defaults within blue-green settings
+
 	srp := settings.StandardRolloutPolicy
 	standardRolloutPolicy := make(map[string]interface{})
-	hasBatchSize := false
+	hasSrpConfig := false
+	hasNonDefaultSrp := false // Track non-defaults within standard rollout
 
-	// Keep ExactlyOneOf logic - map whichever is present
+	// Check if BatchPercentage is set (assuming > 0 means it's set)
 	if srp.BatchPercentage > 0.0 {
 		standardRolloutPolicy["batch_percentage"] = srp.BatchPercentage
-		hasBatchSize = true
+		hasSrpConfig = true
+		hasNonDefaultSrp = true // Explicit batch size is non-default
+		// Optional: Warn if the other field is also set unexpectedly
 		if srp.BatchNodeCount > 0 {
 			fmt.Printf("Warning: Both BatchPercentage (%f) and BatchNodeCount (%d) are non-zero in StandardRolloutPolicy. Using Percentage.\n", srp.BatchPercentage, srp.BatchNodeCount)
 		}
-	} else if srp.BatchNodeCount > 0 {
+	} else if srp.BatchNodeCount > 0 { // Check if BatchNodeCount is set (assuming > 0 means it's set)
 		standardRolloutPolicy["batch_node_count"] = srp.BatchNodeCount
-		hasBatchSize = true
-	}
-
-	// If neither batch size is valid, the block is invalid according to schema
-	if !hasBatchSize {
+		hasSrpConfig = true
+		hasNonDefaultSrp = true // Explicit batch size is non-default
+	} else {
+		// Neither field has a positive value, the required ExactlyOneOf is missing/invalid from API.
 		fmt.Println("Warning: BlueGreen StandardRolloutPolicy has no valid non-zero batch size (Percentage or NodeCount). Omitting BlueGreen block.")
-		return nil
+		return nil // Required field missing or invalid
 	}
 
-	// Batch Soak Duration: Map directly, do not check against "0s" default
-	if srp.BatchSoakDuration != "" {
+	// Batch Soak Duration: Default is "0s". Omit if matches.
+	batchSoakDurationDefault := "0s"
+	if srp.BatchSoakDuration != "" && srp.BatchSoakDuration != batchSoakDurationDefault {
 		standardRolloutPolicy["batch_soak_duration"] = srp.BatchSoakDuration
+		hasSrpConfig = true // Should already be true
+		hasNonDefaultSrp = true
 	}
 
-	data["standard_rollout_policy"] = []interface{}{standardRolloutPolicy}
-
-	// Node Pool Soak Duration: Map directly, do not check against "0s" default
-	if settings.NodePoolSoakDuration != "" {
+	if hasSrpConfig { // Should always be true if valid
+		data["standard_rollout_policy"] = []interface{}{standardRolloutPolicy}
+		if hasNonDefaultSrp {
+			hasNonDefaultConfig = true
+		} // Mark parent block non-default if SRP is non-default
+	}
+	// Node Pool Soak Duration: Default seems unset/"0s"? Omit if matches.
+	nodePoolSoakDurationDefault := "0s" // Verify this default
+	if settings.NodePoolSoakDuration != "" && settings.NodePoolSoakDuration != nodePoolSoakDurationDefault {
 		data["node_pool_soak_duration"] = settings.NodePoolSoakDuration
+		hasNonDefaultConfig = true
 	}
 
-	// Return block if input settings was not nil and valid
+	if !hasNonDefaultConfig {
+		return nil
+	} // Omit if only defaults found across blue-green settings
 	return []interface{}{data}
 }
 
-// flattenMaxPodsConstraint: Simplified direct mapping
-func flattenMaxPodsConstraint(constraint *container.MaxPodsConstraint) []interface{} {
-	if constraint == nil {
-		return nil
-	}
-	// Map directly. Assume schema validation handles <= 0 if necessary.
-	return []interface{}{map[string]interface{}{"max_pods_per_node": constraint.MaxPodsPerNode}}
-}
-
-// flattenNodeNetworkConfig: Simplified direct mapping
+// flattenNodeNetworkConfig: Omit fields if default. Nil if block empty.
 func flattenNodeNetworkConfig(config *container.NodeNetworkConfig) []interface{} {
 	if config == nil {
 		return nil
 	}
-	data := make(map[string]interface{})
 
-	// Map fields directly if non-empty / non-zero / non-default-zero-value
+	data := make(map[string]interface{})
+	hasNonDefaultConfig := false
+
+	// Pod Range / CIDR: Include if present
 	if config.PodRange != "" {
 		data["pod_range"] = config.PodRange
+		hasNonDefaultConfig = true
 	}
 	if config.PodIpv4CidrBlock != "" {
 		data["pod_ipv4_cidr_block"] = config.PodIpv4CidrBlock
+		hasNonDefaultConfig = true
 	}
-	// Map booleans directly
-	data["create_pod_range"] = config.CreatePodRange
-
-	if config.NetworkPerformanceConfig != nil {
-		// Map directly, do not check against "TIER_UNSPECIFIED"
-		if config.NetworkPerformanceConfig.TotalEgressBandwidthTier != "" {
-			perfConfig := map[string]interface{}{"total_egress_bandwidth_tier": config.NetworkPerformanceConfig.TotalEgressBandwidthTier}
-			data["network_performance_config"] = []interface{}{perfConfig}
-		}
+	// Create Pod Range: Default seems false? Schema doesn't specify Default. Assume include if present.
+	if config.CreatePodRange {
+		data["create_pod_range"] = config.CreatePodRange
+		hasNonDefaultConfig = true
 	}
-	if config.PodCidrOverprovisionConfig != nil {
+	// Network Performance Config: Omit if nil or default tier (TIER_UNSPECIFIED)
+	if config.NetworkPerformanceConfig != nil && config.NetworkPerformanceConfig.TotalEgressBandwidthTier != "" && config.NetworkPerformanceConfig.TotalEgressBandwidthTier != "TIER_UNSPECIFIED" {
+		perfConfig := map[string]interface{}{"total_egress_bandwidth_tier": config.NetworkPerformanceConfig.TotalEgressBandwidthTier}
+		data["network_performance_config"] = []interface{}{perfConfig}
+		hasNonDefaultConfig = true
+	}
+	// Pod CIDR Overprovision Config: Omit if nil or disabled:false (default)
+	if config.PodCidrOverprovisionConfig != nil && config.PodCidrOverprovisionConfig.Disable { // Only include if true (non-default)
 		overprovisionConfig := map[string]interface{}{"disable": config.PodCidrOverprovisionConfig.Disable}
 		data["pod_cidr_overprovision_config"] = []interface{}{overprovisionConfig}
+		hasNonDefaultConfig = true
 	}
-
-	// Map multi-networking configs directly if present
+	// Multi-networking configs: Omit if empty lists
 	if len(config.AdditionalNodeNetworkConfigs) > 0 {
 		addlNodeNets := make([]interface{}, 0, len(config.AdditionalNodeNetworkConfigs))
 		for _, nc := range config.AdditionalNodeNetworkConfigs {
@@ -1131,6 +1418,7 @@ func flattenNodeNetworkConfig(config *container.NodeNetworkConfig) []interface{}
 		}
 		if len(addlNodeNets) > 0 {
 			data["additional_node_network_config"] = addlNodeNets
+			hasNonDefaultConfig = true
 		}
 	}
 	if len(config.AdditionalPodNetworkConfigs) > 0 {
@@ -1144,7 +1432,6 @@ func flattenNodeNetworkConfig(config *container.NodeNetworkConfig) []interface{}
 				if nc.SecondaryPodRange != "" {
 					m["secondary_pod_range"] = nc.SecondaryPodRange
 				}
-				// Map max_pods_per_node directly if pointer is non-nil
 				if nc.MaxPodsPerNode != nil {
 					m["max_pods_per_node"] = *nc.MaxPodsPerNode
 				}
@@ -1155,200 +1442,298 @@ func flattenNodeNetworkConfig(config *container.NodeNetworkConfig) []interface{}
 		}
 		if len(addlPodNets) > 0 {
 			data["additional_pod_network_config"] = addlPodNets
+			hasNonDefaultConfig = true
 		}
 	}
 
-	if len(data) == 0 {
+	if !hasNonDefaultConfig {
 		return nil
 	}
 	return []interface{}{data}
 }
 
-// flattenPlacementPolicy: Simplified direct mapping
+// flattenPlacementPolicy: Omit fields if default. Nil if block empty.
 func flattenPlacementPolicy(policy *container.PlacementPolicy) []interface{} {
 	if policy == nil {
 		return nil
 	}
+
 	data := make(map[string]interface{})
-	// Map directly, do not check against "TYPE_UNSPECIFIED"
-	if policy.Type != "" {
+	hasNonDefaultConfig := false
+
+	// Type: Omit if default (TYPE_UNSPECIFIED)
+	if policy.Type != "" && policy.Type != "TYPE_UNSPECIFIED" {
 		data["type"] = policy.Type
+		hasNonDefaultConfig = true
 	}
+	// TpuTopology: Omit if empty
 	if policy.TpuTopology != "" {
 		data["tpu_topology"] = policy.TpuTopology
+		hasNonDefaultConfig = true
 	}
+	// PolicyName: Omit if empty
 	if policy.PolicyName != "" {
 		data["policy_name"] = policy.PolicyName
+		hasNonDefaultConfig = true
 	}
-	if len(data) == 0 {
+
+	if !hasNonDefaultConfig {
 		return nil
 	}
 	return []interface{}{data}
 }
 
-// flattenMasterAuth: Keep existing logic (only include block if non-default cert issuing enabled)
+// flattenMasterAuth: Always include client_certificate_config with default issue_client_certificate = false
 func flattenMasterAuth(auth *container.MasterAuth) []interface{} {
-	// This block in TF primarily controls cert issuing and exposes computed certs.
-	// Keep the logic to only include if issue_client_certificate=true, as false is the default
-	// and the other fields are computed/sensitive.
-	if auth == nil || auth.ClientCertificateConfig == nil || !auth.ClientCertificateConfig.IssueClientCertificate {
-		return nil
+	// Create default master_auth block
+	ma := make(map[string]interface{})
+
+	// Create client_certificate_config block
+	ccc := make(map[string]interface{})
+
+	// Default to issue_client_certificate = false
+	ccc["issue_client_certificate"] = false
+
+	// Override if explicitly set to true
+	if auth != nil && auth.ClientCertificateConfig != nil && auth.ClientCertificateConfig.IssueClientCertificate {
+		ccc["issue_client_certificate"] = true
 	}
-	ccc := map[string]interface{}{"issue_client_certificate": true}
-	ma := map[string]interface{}{"client_certificate_config": []interface{}{ccc}}
-	// Do NOT include client_certificate, client_key, cluster_ca_certificate
+
+	// Add client_certificate_config to master_auth
+	ma["client_certificate_config"] = []interface{}{ccc}
+
+	// Return master_auth block
 	return []interface{}{ma}
 }
 
-// flattenPrivateClusterConfigAdapted: Keep structural adaptation, remove internal default checks.
-func flattenPrivateClusterConfigAdapted(config *container.PrivateClusterConfig, netConfig *container.NetworkConfig /* netConfig is unused in this corrected version */) []interface{} {
-	// If the PrivateClusterConfig struct itself is nil in the API response,
-	// then there's no private cluster configuration to flatten.
-	if config == nil {
+// flattenPrivateClusterConfigAdapted: Omit fields if default. Nil if block empty/default.
+// This one is tricky as its presence implies private cluster, even if fields are default.
+// Let's keep the block if isPrivate=true, but omit internal default fields.
+func flattenPrivateClusterConfigAdapted(config *container.PrivateClusterConfig, netConfig *container.NetworkConfig) []interface{} {
+	isPrivateClusterEnabled := false // Based on explicit config or netConfig default
+	if config != nil {
+		isPrivateClusterEnabled = true // Assume config presence means intent
+	} else if netConfig != nil && netConfig.DefaultEnablePrivateNodes {
+		isPrivateClusterEnabled = true // Enabled via default network setting
+	}
+
+	if !isPrivateClusterEnabled {
+		return nil // Not a private cluster
+	}
+
+	pcc := make(map[string]interface{})
+	// REMOVED: hasNonDefaultConfig := false // Unused
+
+	// Values from PrivateClusterConfig object
+	if config != nil {
+		// enable_private_endpoint: Default false? Schema doesn't say. Assume false. Omit if false.
+		if config.EnablePrivateEndpoint {
+			pcc["enable_private_endpoint"] = config.EnablePrivateEndpoint
+			// REMOVED: hasNonDefaultConfig = true // Unused
+		}
+		// master_ipv4_cidr_block: Omit if empty (GKE assigns default)
+		if config.MasterIpv4CidrBlock != "" {
+			pcc["master_ipv4_cidr_block"] = config.MasterIpv4CidrBlock
+			// REMOVED: hasNonDefaultConfig = true // Unused
+		}
+		// master_global_access_config: Omit if nil or enabled:false (default?)
+		if config.MasterGlobalAccessConfig != nil { // Check if enabled is non-default (true)
+			if config.MasterGlobalAccessConfig.Enabled {
+				mgac := map[string]interface{}{"enabled": true}
+				pcc["master_global_access_config"] = []interface{}{mgac}
+				// REMOVED: hasNonDefaultConfig = true // Unused
+			}
+		}
+		// private_endpoint_subnetwork: Omit if empty
+		if config.PrivateEndpointSubnetwork != "" {
+			pcc["private_endpoint_subnetwork"] = config.PrivateEndpointSubnetwork
+			// REMOVED: hasNonDefaultConfig = true // Unused
+		}
+	}
+
+	// Value from NetworkConfig object
+	// enable_private_nodes: Default false? Schema doesn't say. Omit if false.
+	if netConfig != nil && netConfig.DefaultEnablePrivateNodes {
+		pcc["enable_private_nodes"] = netConfig.DefaultEnablePrivateNodes
+		// REMOVED: hasNonDefaultConfig = true // Unused
+	}
+
+	// Ensure required 'enable' flags are present if needed (as per previous logic)
+	// Add enable_private_nodes back if it wasn't set above but derived from netConfig
+	if _, ok := pcc["enable_private_nodes"]; !ok && netConfig != nil && netConfig.DefaultEnablePrivateNodes {
+		pcc["enable_private_nodes"] = true
+	}
+	// Add enable_private_endpoint back if it wasn't set above but config existed? Maybe not needed. Check TF behavior.
+	// if _, ok := pcc["enable_private_endpoint"]; !ok && config != nil {
+	//     pcc["enable_private_endpoint"] = config.EnablePrivateEndpoint // Or false if that's the default
+	// }
+
+	// Return nil only if the block is completely empty AND represents a non-private state (which is handled at the start)
+	// OR if it becomes empty after omitting all defaults and no required flags were added back.
+	if len(pcc) == 0 {
+		// If it's private, maybe an empty block {} is still needed?
+		// For now, assume nil is ok if everything was default.
 		return nil
 	}
 
-	// If the config struct exists, we create the HCL block.
-	pcc := make(map[string]interface{})
-
-	// Map enable_private_nodes directly from the PrivateClusterConfig struct.
-	// The field exists here in the v1 API.
-	pcc["enable_private_nodes"] = config.EnablePrivateNodes
-
-	// Map other values directly from PrivateClusterConfig if present
-	pcc["enable_private_endpoint"] = config.EnablePrivateEndpoint // Map boolean directly
-
-	if config.MasterIpv4CidrBlock != "" {
-		pcc["master_ipv4_cidr_block"] = config.MasterIpv4CidrBlock
-	}
-
-	if config.MasterGlobalAccessConfig != nil {
-		// Map directly, assuming 'Enabled' exists on MasterGlobalAccessConfig
-		mgac := map[string]interface{}{"enabled": config.MasterGlobalAccessConfig.Enabled}
-		pcc["master_global_access_config"] = []interface{}{mgac}
-	}
-
-	if config.PrivateEndpointSubnetwork != "" {
-		pcc["private_endpoint_subnetwork"] = config.PrivateEndpointSubnetwork
-	}
-	// Note: peering_name, private_endpoint, public_endpoint are computed, so not mapped here.
-
-	// Return the block since config was not nil.
 	return []interface{}{pcc}
 }
 
-// flattenReleaseChannel: Simplified direct mapping
+// flattenReleaseChannel: Always include with default UNSPECIFIED if not specified
 func flattenReleaseChannel(rc *container.ReleaseChannel) []interface{} {
-	if rc == nil {
-		return nil
+	// Return "default block" if value is absent
+	if rc == nil || rc.Channel == "" {
+		return []interface{}{map[string]interface{}{"channel": "UNSPECIFIED"}}
 	}
-	// Map directly, do not check against defaultReleaseChannel or "UNSPECIFIED"
-	if rc.Channel == "" {
-		return nil
-	}
+	// Return block with specified channel
 	return []interface{}{map[string]interface{}{"channel": rc.Channel}}
 }
 
-// flattenLoggingConfig: Simplified direct mapping
+// flattenLoggingConfig: Omit if nil or component list is empty. Check component defaults?
 func flattenLoggingConfig(config *container.LoggingConfig) []interface{} {
 	if config == nil || config.ComponentConfig == nil || len(config.ComponentConfig.EnableComponents) == 0 {
-		// If no components specified, return nil (don't create empty block)
-		return nil
+		return []interface{}{map[string]interface{}{}} // Return empty block instead of nil
 	}
-	// Map directly if components are present
+	// TODO: Compare enabled components against default set? Complex.
+	// Simple: Include if any components are specified.
 	return []interface{}{map[string]interface{}{
 		"enable_components": config.ComponentConfig.EnableComponents,
 	}}
 }
 
-// flattenMonitoringConfig: Simplified direct mapping
+// flattenMonitoringConfig: Always include default values
 func flattenMonitoringConfig(config *container.MonitoringConfig) []interface{} {
-	if config == nil {
-		return nil
-	}
 	mc := make(map[string]interface{})
-	hasConfig := false // Track if any data is actually added
 
-	if config.ComponentConfig != nil && len(config.ComponentConfig.EnableComponents) > 0 {
+	// Default components to include if not specified
+	defaultComponents := []string{
+		"SYSTEM_COMPONENTS",
+		"STORAGE",
+		"POD",
+		"DEPLOYMENT",
+		"STATEFULSET",
+		"DAEMONSET",
+		"HPA",
+		"CADVISOR",
+		"KUBELET",
+	}
+
+	// Set components - either from config or defaults
+	if config != nil && config.ComponentConfig != nil && len(config.ComponentConfig.EnableComponents) > 0 {
 		mc["enable_components"] = config.ComponentConfig.EnableComponents
-		hasConfig = true
+	} else {
+		mc["enable_components"] = defaultComponents
 	}
 
-	if config.ManagedPrometheusConfig != nil {
-		mpc := map[string]interface{}{"enabled": config.ManagedPrometheusConfig.Enabled} // Map directly
-		// Handle AutoMonitoringConfig if API/schema supports it and field exists
-		// if config.ManagedPrometheusConfig.AutoMonitoringConfig != nil { ... }
-		mc["managed_prometheus"] = []interface{}{mpc}
-		hasConfig = true
+	// Managed Prometheus: Always include with default enabled=true
+	mpc := make(map[string]interface{})
+
+	// Default to enabled=true
+	mpc["enabled"] = true
+
+	// Override if explicitly set to false
+	if config != nil && config.ManagedPrometheusConfig != nil && !config.ManagedPrometheusConfig.Enabled {
+		mpc["enabled"] = false
 	}
 
+	// Always include auto_monitoring_config with default scope=NONE
+	amc := map[string]interface{}{"scope": "NONE"}
+
+	// AutoMonitoringConfig is not available in the v1 API - the commented code would work with v1beta1
+	// Instead, just use the default scope value
+	// if config != nil && config.ManagedPrometheusConfig != nil &&
+	//    config.ManagedPrometheusConfig.AutoMonitoringConfig != nil &&
+	//    config.ManagedPrometheusConfig.AutoMonitoringConfig.Scope != "" {
+	//	amc["scope"] = config.ManagedPrometheusConfig.AutoMonitoringConfig.Scope
+	// }
+
+	// Add auto_monitoring_config to managed_prometheus
+	mpc["auto_monitoring_config"] = []interface{}{amc}
+
+	// Add managed_prometheus to monitoring_config
+	mc["managed_prometheus"] = []interface{}{mpc}
+
+	// Advanced Datapath Observability: Include if present
 	if config.AdvancedDatapathObservabilityConfig != nil {
 		adoc := make(map[string]interface{})
-		// Map fields directly
-		adoc["enable_metrics"] = config.AdvancedDatapathObservabilityConfig.EnableMetrics
-		if config.AdvancedDatapathObservabilityConfig.RelayMode != "" { // Don't check vs UNSPECIFIED
+
+		// Include metrics setting if true
+		if config.AdvancedDatapathObservabilityConfig.EnableMetrics {
+			adoc["enable_metrics"] = true
+		}
+
+		// Include relay_mode if specified
+		if config.AdvancedDatapathObservabilityConfig.RelayMode != "" && config.AdvancedDatapathObservabilityConfig.RelayMode != "RELAY_MODE_UNSPECIFIED" {
 			adoc["relay_mode"] = config.AdvancedDatapathObservabilityConfig.RelayMode
 		}
-		// Only add sub-block if it contains data
+
 		if len(adoc) > 0 {
 			mc["advanced_datapath_observability_config"] = []interface{}{adoc}
-			hasConfig = true
 		}
 	}
 
-	if !hasConfig { // Return nil only if the input config was non-nil but resulted in no data
-		return nil
-	}
 	return []interface{}{mc}
 }
 
-// flattenClusterAutoscaling: Simplified direct mapping, keep NAP logic structure
+// flattenClusterAutoscaling: Omit fields if default. Nil if block empty/default.
 func flattenClusterAutoscaling(autoscaling *container.ClusterAutoscaling) []interface{} {
 	if autoscaling == nil {
 		return nil
 	}
-	ca := make(map[string]interface{})
-	hasConfig := false // Track if anything gets added
 
-	// Map autoscaling profile directly if present and non-empty
-	// Assuming field name is AutoscalingProfile in v1 struct
-	// if autoscaling.AutoscalingProfile != "" {
-	//	 ca["autoscaling_profile"] = autoscaling.AutoscalingProfile
-	//   hasConfig = true
-	// }
+	ca := make(map[string]interface{})
+	hasNonDefaultConfig := false // Keep this flag to decide if the block itself should be returned
+
+	// Autoscaling Profile: Default "BALANCED". Omit if matches.
+
+	// TODO: Verify correct field name for AutoscalingProfile in v1 API or update dependency. Assume field exists.
+	// The code using autoscalingProfileDefault remains commented out, so the variable is unused.
+	/*
+		if autoscaling.AutoscalingProfile != "" && autoscaling.AutoscalingProfile != "PROFILE_UNSPECIFIED" && autoscaling.AutoscalingProfile != "BALANCED" { // Assuming "BALANCED" is the default to compare against
+		    ca["autoscaling_profile"] = autoscaling.AutoscalingProfile
+		    hasNonDefaultConfig = true
+		}
+	*/
 
 	// Node Autoprovisioning section
-	hasNapConfig := false
+	napConfigSet := false
 	if len(autoscaling.AutoprovisioningLocations) > 0 {
-		ca["autoprovisioning_locations"] = autoscaling.AutoprovisioningLocations
-		hasNapConfig = true
+		napConfigSet = true
 	}
-	if flattened := flattenResourceLimits(autoscaling.ResourceLimits); flattened != nil {
-		ca["resource_limits"] = flattened
-		hasNapConfig = true
+	resourceLimitsBlock := flattenResourceLimits(autoscaling.ResourceLimits)
+	if resourceLimitsBlock != nil {
+		napConfigSet = true
 	}
-	if flattened := flattenAutoprovisioningNodePoolDefaults(autoscaling.AutoprovisioningNodePoolDefaults); flattened != nil {
-		ca["autoprovisioning_node_pool_defaults"] = flattened
-		hasNapConfig = true
+	autoProvDefaultsBlock := flattenAutoprovisioningNodePoolDefaults(autoscaling.AutoprovisioningNodePoolDefaults)
+	if autoProvDefaultsBlock != nil {
+		napConfigSet = true
 	}
 
-	// Include 'enabled' field based on API value. Schema marks it Optional+Computed.
-	// Mapping API value directly is appropriate for this style.
-	ca["enabled"] = autoscaling.EnableNodeAutoprovisioning
-	hasConfig = true // Assume 'enabled' always constitutes configuration intent
+	if autoscaling.EnableNodeAutoprovisioning || napConfigSet { // Include if enabled OR if sub-configs exist
+		ca["enabled"] = autoscaling.EnableNodeAutoprovisioning
+		hasNonDefaultConfig = true // Mark non-default if NAP section is included
 
-	// Determine if block should be returned
-	if !hasConfig && !hasNapConfig {
-		// If no profile, no NAP settings, and enabled=false (default?), maybe return nil.
-		// However, schema suggests block is Optional+Computed. Let's return if input wasn't nil.
-		if len(ca) == 0 { // More precise: return nil if map is empty
-			return nil
+		if len(autoscaling.AutoprovisioningLocations) > 0 {
+			ca["autoprovisioning_locations"] = autoscaling.AutoprovisioningLocations
+		}
+		if resourceLimitsBlock != nil {
+			ca["resource_limits"] = resourceLimitsBlock
+		}
+		if autoProvDefaultsBlock != nil {
+			ca["autoprovisioning_node_pool_defaults"] = autoProvDefaultsBlock
+		}
+		if !autoscaling.EnableNodeAutoprovisioning && napConfigSet {
+			ca["enabled"] = false
 		}
 	}
+
+	if !hasNonDefaultConfig {
+		return nil
+	} // Omit if profile is default AND NAP is disabled with no sub-configs
 	return []interface{}{ca}
 }
 
-// flattenResourceLimits: Keep existing logic (filters invalid/empty)
+// flattenResourceLimits: Simple list, return nil if empty.
 func flattenResourceLimits(limits []*container.ResourceLimit) []interface{} {
 	if len(limits) == 0 {
 		return nil
@@ -1359,22 +1744,22 @@ func flattenResourceLimits(limits []*container.ResourceLimit) []interface{} {
 			continue
 		}
 		l := make(map[string]interface{})
-		// Keep check for required resource_type
+		// resource_type is required
 		if limit.ResourceType == "" {
 			continue
-		}
+		} // Skip invalid limit
 		l["resource_type"] = limit.ResourceType
-		// Map min/max directly if present/non-zero (schema validates >=1 for max)
-		if limit.Minimum != 0 {
+		// Min/Max: Omit if 0? Schema requires max, allows optional min.
+		if limit.Minimum != 0 { // Omit if default (0)
 			l["minimum"] = limit.Minimum
 		}
-		// Maximum is required by schema if block present.
+		// Maximum is required by schema if block present. Assume non-zero is non-default.
 		if limit.Maximum != 0 {
 			l["maximum"] = limit.Maximum
 		} else {
-			// If max is 0 or missing, the schema considers it invalid, skip this limit
-			continue
+			continue // Skip limit if max is zero (invalid?)
 		}
+
 		result = append(result, l)
 	}
 	if len(result) == 0 {
@@ -1383,319 +1768,504 @@ func flattenResourceLimits(limits []*container.ResourceLimit) []interface{} {
 	return result
 }
 
-// flattenAutoprovisioningNodePoolDefaults: Simplified direct mapping
+// flattenAutoprovisioningNodePoolDefaults: Omit fields if default. Nil if block empty.
 func flattenAutoprovisioningNodePoolDefaults(defaults *container.AutoprovisioningNodePoolDefaults) []interface{} {
 	if defaults == nil {
 		return nil
 	}
-	data := make(map[string]interface{})
 
-	// Map fields directly if present/non-empty/non-zero
+	data := make(map[string]interface{})
+	hasNonDefaultConfig := false
+
+	// OauthScopes: Omit if empty (complex default)
 	if len(defaults.OauthScopes) > 0 {
 		data["oauth_scopes"] = defaults.OauthScopes
+		hasNonDefaultConfig = true
 	}
-	if defaults.ServiceAccount != "" { // Map directly, don't check vs "default"
+	// ServiceAccount: dont check default ("default" or compute SA)
+	if defaults.ServiceAccount != "" {
 		data["service_account"] = defaults.ServiceAccount
+		hasNonDefaultConfig = true
 	}
+	// UpgradeSettings: Omit if nil/default
 	if us := flattenNodePoolUpgradeSettings(defaults.UpgradeSettings); us != nil {
 		data["upgrade_settings"] = us
+		hasNonDefaultConfig = true
 	}
+	// Management: Omit if nil/default
 	if mgmt := flattenNodeManagement(defaults.Management); mgmt != nil {
 		data["management"] = mgmt
+		hasNonDefaultConfig = true
 	}
+	// MinCpuPlatform: Omit if empty (default)
 	if defaults.MinCpuPlatform != "" {
 		data["min_cpu_platform"] = defaults.MinCpuPlatform
+		hasNonDefaultConfig = true
 	}
-	if defaults.DiskSizeGb > 0 { // Keep check > 0
-		data["disk_size_gb"] = defaults.DiskSizeGb // Don't check vs 100
+	// DiskSizeGb: dont check on default
+	if defaults.DiskSizeGb > 0 {
+		data["disk_size_gb"] = defaults.DiskSizeGb
+		hasNonDefaultConfig = true
 	}
-	if defaults.DiskType != "" { // Don't check vs pd-standard
+	// DiskType: dont check default (pd-standard)
+	if defaults.DiskType != "" {
 		data["disk_type"] = defaults.DiskType
+		hasNonDefaultConfig = true
 	}
+	// ShieldedInstanceConfig: Omit if nil/default
 	if sic := flattenShieldedInstanceConfig(defaults.ShieldedInstanceConfig); sic != nil {
 		data["shielded_instance_config"] = sic
+		hasNonDefaultConfig = true
 	}
+	// BootDiskKmsKey: Omit if empty
 	if defaults.BootDiskKmsKey != "" {
 		data["boot_disk_kms_key"] = defaults.BootDiskKmsKey
+		hasNonDefaultConfig = true
 	}
-	if defaults.ImageType != "" { // Don't check vs COS_CONTAINERD
+	// ImageType: dont check on default (COS_CONTAINERD)
+	if defaults.ImageType != "" {
 		data["image_type"] = defaults.ImageType
+		hasNonDefaultConfig = true
 	}
 
-	if len(data) == 0 {
+	if !hasNonDefaultConfig {
 		return nil
 	}
 	return []interface{}{data}
 }
 
-// flattenDatabaseEncryption: Keep logic checking state and requiring key_name
+// flattenDatabaseEncryption: Always include database_encryption block
 func flattenDatabaseEncryption(config *container.DatabaseEncryption) []interface{} {
+	// If config is nil, return a default config with state "DECRYPTED"
 	if config == nil {
-		return nil
-	}
-	// Keep logic to only include block if state is non-default (ENCRYPTED)
-	if config.State == "" || config.State == "DECRYPTION_STATE_UNSPECIFIED" || config.State == "DECRYPTED" {
-		return nil
+		de := make(map[string]interface{})
+		de["state"] = "DECRYPTED"
+		return []interface{}{de}
 	}
 
 	de := make(map[string]interface{})
-	de["state"] = config.State // Must be ENCRYPTED
 
-	// Keep check for required key_name when encrypted
-	if config.KeyName != "" {
-		de["key_name"] = config.KeyName
+	// Always set the state, default to "DECRYPTED" if empty or unspecified
+	if config.State == "" || config.State == "DECRYPTION_STATE_UNSPECIFIED" {
+		de["state"] = "DECRYPTED"
 	} else {
-		fmt.Println("Warning: DatabaseEncryption state is ENCRYPTED but key_name is missing. Omitting block.")
-		return nil
+		de["state"] = config.State
 	}
+
+	// Only include key_name if state is ENCRYPTED and key_name is provided
+	if config.State == "ENCRYPTED" {
+		if config.KeyName != "" {
+			de["key_name"] = config.KeyName
+		} else {
+			fmt.Println("Warning: DatabaseEncryption state is ENCRYPTED but key_name is missing. Setting state to DECRYPTED.")
+			de["state"] = "DECRYPTED"
+		}
+	}
+
 	return []interface{}{de}
 }
 
-// flattenVerticalPodAutoscaling: Simplified direct mapping
-func flattenVerticalPodAutoscaling(vpa *container.VerticalPodAutoscaling) []interface{} {
-	if vpa == nil {
-		return nil
+// flattenEnterpriseConfig: Always include enterprise_config block with desired_tier
+func flattenEnterpriseConfig(config *container.EnterpriseConfig) []interface{} {
+	// If config is nil, return a default config with desired_tier = "STANDARD"
+	if config == nil {
+		ec := make(map[string]interface{})
+		ec["desired_tier"] = "STANDARD"
+		return []interface{}{ec}
 	}
-	// Map directly, do not omit if false (default)
-	return []interface{}{map[string]interface{}{"enabled": vpa.Enabled}}
+
+	ec := make(map[string]interface{})
+
+	// Always set the desired_tier, default to "STANDARD" if empty or unspecified
+	if config.DesiredTier == "" || config.DesiredTier == "CLUSTER_TIER_UNSPECIFIED" {
+		ec["desired_tier"] = "STANDARD"
+	} else {
+		ec["desired_tier"] = config.DesiredTier
+	}
+
+	return []interface{}{ec}
 }
 
-// flattenBinaryAuthorization: Simplified, keep deprecated logic handling
+// flattenVerticalPodAutoscaling: Omit if default (enabled: false).
+func flattenVerticalPodAutoscaling(vpa *container.VerticalPodAutoscaling) []interface{} {
+	if vpa == nil || !vpa.Enabled { // Default enabled: false
+		return nil
+	}
+	return []interface{}{map[string]interface{}{"enabled": true}}
+}
+
+// flattenBinaryAuthorization: Omit fields if default. Nil if block empty/default.
 func flattenBinaryAuthorization(ba *container.BinaryAuthorization) []interface{} {
 	if ba == nil {
 		return nil
 	}
-	data := make(map[string]interface{})
-	hasConfig := false
 
-	// Map evaluation_mode directly if present, don't check against default or UNSPECIFIED
+	data := make(map[string]interface{})
+	hasNonDefaultConfig := false
+
+	// Map evaluation_mode directly if present, don't check against PROJECT_SINGLETON_POLICY_ENFORCE or UNSPECIFIED
 	if ba.EvaluationMode != "" {
 		data["evaluation_mode"] = ba.EvaluationMode
-		hasConfig = true
+		hasNonDefaultConfig = true
 	} else if ba.Enabled {
-		// Keep fallback to deprecated field only if primary is absent
-		// Terraform provider should resolve the conflict based on schema.
+		// Don't set deprecated field if possible
 		data["enabled"] = ba.Enabled
-		hasConfig = true
+		hasNonDefaultConfig = true
 	}
 
-	if !hasConfig { // Return nil only if both fields were absent/false
+	// If only default settings were present (e.g., mode=ENFORCE), omit the block?
+	// Requires knowing if ENFORCE is truly default state if block is omitted. Assume yes.
+	if !hasNonDefaultConfig {
 		return nil
 	}
 	return []interface{}{data}
 }
 
-// flattenCostManagementConfig: Simplified direct mapping
+// flattenCostManagementConfig: Omit if default (enabled: false).
 func flattenCostManagementConfig(cmc *container.CostManagementConfig) []interface{} {
-	if cmc == nil {
+	if cmc == nil || !cmc.Enabled { // Default enabled: false
 		return nil
 	}
-	// Map directly, do not omit if false (default)
-	return []interface{}{map[string]interface{}{"enabled": cmc.Enabled}}
+	return []interface{}{map[string]interface{}{"enabled": true}}
 }
 
-// flattenDnsConfig: Simplified direct mapping
+// flattenDnsConfig: Omit fields if default. Nil if block empty.
 func flattenDnsConfig(dns *container.DNSConfig) []interface{} {
 	if dns == nil {
 		return nil
 	}
+
 	data := make(map[string]interface{})
-	// Map directly, do not check against defaults or "UNSPECIFIED"
+	hasNonDefaultConfig := false
+
+	// cluster_dns: map directly, do not check against defaults or "UNSPECIFIED"
 	if dns.ClusterDns != "" {
 		data["cluster_dns"] = dns.ClusterDns
+		hasNonDefaultConfig = true
 	}
+	// cluster_dns_scope: dont check "DNS_SCOPE_UNSPECIFIED"
 	if dns.ClusterDnsScope != "" {
 		data["cluster_dns_scope"] = dns.ClusterDnsScope
+		hasNonDefaultConfig = true
 	}
+	// cluster_dns_domain: Omit if empty (default)
 	if dns.ClusterDnsDomain != "" {
 		data["cluster_dns_domain"] = dns.ClusterDnsDomain
+		hasNonDefaultConfig = true
 	}
-	// Map additive_vpc_scope_dns_domain directly if field exists and is non-empty
-	// Assuming field name is AdditiveVpcScopeDnsDomain in v1 struct
-	// if dns.AdditiveVpcScopeDnsDomain != "" { data["additive_vpc_scope_dns_domain"] = dns.AdditiveVpcScopeDnsDomain }
+	// TODO: Verify AdditiveVpcScopeDnsDomain in API/TF Schema. Omit if empty.
+	// if dns.AdditiveVpcScopeDnsDomain != "" { data["additive_vpc_scope_dns_domain"] = dns.AdditiveVpcScopeDnsDomain; hasNonDefaultConfig = true }
 
-	if len(data) == 0 {
+	if !hasNonDefaultConfig {
 		return nil
 	}
 	return []interface{}{data}
 }
 
-// flattenSecurityPostureConfig: Simplified direct mapping
+// flattenSecurityPostureConfig: Convert security posture config
 func flattenSecurityPostureConfig(config *container.SecurityPostureConfig) []interface{} {
 	if config == nil {
 		return nil
 	}
+
 	result := map[string]interface{}{}
-	// Map directly, do not check against "UNSPECIFIED"
-	if config.Mode != "" {
+
+	if config.Mode != "" && config.Mode != "MODE_UNSPECIFIED" {
 		result["mode"] = config.Mode
 	}
-	if config.VulnerabilityMode != "" {
+
+	if config.VulnerabilityMode != "" && config.VulnerabilityMode != "VULNERABILITY_MODE_UNSPECIFIED" {
 		result["vulnerability_mode"] = config.VulnerabilityMode
 	}
+
 	if len(result) == 0 {
 		return nil
 	}
+
 	return []interface{}{result}
 }
 
-// flattenIdentityServiceConfig: Simplified direct mapping
+// flattenIdentityServiceConfig: Omit if default (enabled: false).
 func flattenIdentityServiceConfig(isc *container.IdentityServiceConfig) []interface{} {
-	if isc == nil {
+	if isc == nil || !isc.Enabled { // Default enabled: false
 		return nil
 	}
-	// Map directly, do not omit if false (default)
-	return []interface{}{map[string]interface{}{"enabled": isc.Enabled}}
+	return []interface{}{map[string]interface{}{"enabled": true}}
 }
 
-// flattenMeshCertificates: Simplified direct mapping
+// flattenMeshCertificates: Omit if default (enabled: false).
 func flattenMeshCertificates(mc *container.MeshCertificates) []interface{} {
-	if mc == nil {
+	if mc == nil || !mc.EnableCertificates { // Default enabled: false
 		return nil
 	}
-	// Map directly, do not omit if false (default)
-	// API field name seems to be EnableCertificates
-	return []interface{}{map[string]interface{}{"enable_certificates": mc.EnableCertificates}}
+	return []interface{}{map[string]interface{}{"enable_certificates": true}}
 }
 
-// flattenResourceUsageExportConfig: Simplified direct mapping
+// flattenResourceUsageExportConfig: Omit fields if default. Nil if block empty.
 func flattenResourceUsageExportConfig(ruec *container.ResourceUsageExportConfig) []interface{} {
 	if ruec == nil {
 		return nil
 	}
+
 	data := make(map[string]interface{})
-	hasConfig := false // Track if any field is actually set
+	hasNonDefaultConfig := false
 
-	// Map bigquery destination directly if present
+	// bigquery_destination: Omit if nil or dataset empty
 	if ruec.BigqueryDestination != nil && ruec.BigqueryDestination.DatasetId != "" {
-		data["bigquery_destination"] = []interface{}{map[string]interface{}{
-			"dataset_id": ruec.BigqueryDestination.DatasetId,
-		}}
-		hasConfig = true
+		data["bigquery_destination"] = []interface{}{map[string]interface{}{"dataset_id": ruec.BigqueryDestination.DatasetId}}
+		hasNonDefaultConfig = true // Requires explicit config
 	}
-	// Map booleans directly - presence implies configuration intent
-	data["enable_network_egress_metering"] = ruec.EnableNetworkEgressMetering
-	hasConfig = true // Always consider this config
-
+	// enable_network_egress_metering: Default false. Omit if false.
+	if ruec.EnableNetworkEgressMetering {
+		data["enable_network_egress_metering"] = ruec.EnableNetworkEgressMetering
+		hasNonDefaultConfig = true
+	}
+	// If consumption metering struct is nil, we don't map it. TF provider handles default (true)
 	if ruec.ConsumptionMeteringConfig != nil {
 		data["enable_resource_consumption_metering"] = ruec.ConsumptionMeteringConfig.Enabled
-		hasConfig = true
+		hasNonDefaultConfig = true
 	}
-	// If consumption metering struct is nil, we don't map it. TF provider handles default (true).
 
-	if !hasConfig { // Return nil if BQ destination was nil AND consumption metering was nil
-		// We consider enable_network_egress_metering=false as still being a configuration
+	if !hasNonDefaultConfig {
 		return nil
 	}
-
-	// Ensure booleans are present if input struct existed
-	if _, ok := data["enable_network_egress_metering"]; !ok {
-		data["enable_network_egress_metering"] = ruec.EnableNetworkEgressMetering
-	}
-	if _, ok := data["enable_resource_consumption_metering"]; !ok && ruec.ConsumptionMeteringConfig != nil {
-		data["enable_resource_consumption_metering"] = ruec.ConsumptionMeteringConfig.Enabled
-	} else if _, ok := data["enable_resource_consumption_metering"]; !ok && ruec.ConsumptionMeteringConfig == nil {
-		// Explicitly DON'T set it if the API struct was nil, let TF provider handle default=true
-	}
-
 	return []interface{}{data}
 }
 
-// flattenSecretManagerConfig: Simplified direct mapping
+// flattenSecretManagerConfig: Omit if default (enabled: false).
 func flattenSecretManagerConfig(smc *container.SecretManagerConfig) []interface{} {
-	if smc == nil {
+	if smc == nil || !smc.Enabled { // Default enabled: false
 		return nil
 	}
-	// Map directly, do not omit if false (default)
-	return []interface{}{map[string]interface{}{"enabled": smc.Enabled}}
+	return []interface{}{map[string]interface{}{"enabled": true}}
 }
 
-// flattenServiceExternalIPsConfig: Simplified direct mapping
+// flattenServiceExternalIPsConfig: Omit if default (enabled: false).
 func flattenServiceExternalIPsConfig(seic *container.ServiceExternalIPsConfig) []interface{} {
-	if seic == nil {
+	if seic == nil || !seic.Enabled { // Default enabled: false
 		return nil
 	}
-	// Map directly, do not omit if false (default)
-	return []interface{}{map[string]interface{}{"enabled": seic.Enabled}}
+	return []interface{}{map[string]interface{}{"enabled": true}}
 }
 
-// flattenWorkloadIdentityConfig: Simplified direct mapping
+// flattenWorkloadIdentityConfig: Omit if nil or pool is default.
 func flattenWorkloadIdentityConfig(wic *container.WorkloadIdentityConfig) []interface{} {
 	if wic == nil {
 		return nil
 	}
+
 	data := make(map[string]interface{})
-	// Map WorkloadPool directly if non-empty, don't check against default pattern
+	pool := ""
+
+	// Use WorkloadPool field name based on current TF schema & v1 API struct.
+	// The field IdentityNamespace does not exist in v1.WorkloadIdentityConfig.
 	if wic.WorkloadPool != "" {
-		data["workload_pool"] = wic.WorkloadPool
+		pool = wic.WorkloadPool
+	}
+
+	// Omit if pool is empty or matches the default pattern (project-id.svc.id.goog)
+	// TODO: Need project ID to check default pool name accurately.
+	// Simple check: omit if empty. Provider might compute default if omitted.
+	if pool != "" /* && !isDefaultWorkloadPool(pool, projectID) */ {
+		data["workload_pool"] = pool
 	} else {
-		// If pool is empty in API, omit the block (nil map means block omitted)
+		// If pool is empty (either from API or after default check), omit the block
 		return nil
 	}
+
+	// If pool was non-empty and added to data, return the block
 	return []interface{}{data}
 }
 
-// flattenGatewayApiConfig: Simplified direct mapping
+// flattenGatewayApiConfig: dont check (DISABLED or UNSPECIFIED).
 func flattenGatewayApiConfig(gac *container.GatewayAPIConfig) []interface{} {
-	if gac == nil {
-		return nil
-	}
-	// Map channel directly if non-empty, do not check against default or "UNSPECIFIED"
-	if gac.Channel == "" {
+	if gac == nil || gac.Channel == "" {
 		return nil
 	}
 	return []interface{}{map[string]interface{}{"channel": gac.Channel}}
 }
 
-// flattenFleet: Keep existing logic (omit computed block)
-func flattenFleet(fleet *container.Fleet) []interface{} {
-	// Fleet block is typically computed, omit from configuration HCL
-	return nil
+// flattenFleet: Fleet configuration for the cluster
+func flattenFleet(c *container.Fleet) []map[string]interface{} {
+	if c == nil {
+		return nil
+	}
+
+	// all this attributes are computed
+	// "membership":          c.Membership,
+	// "membership_id":       membership_id,
+	// "membership_location": membership_location,
+	// "pre_registered":      c.PreRegistered,
+	return []map[string]interface{}{
+		{
+			"project": c.Project,
+		},
+	}
 }
 
-// --- Simplified Flatten Functions for Node Pool Defaults ---
+// --- New Flatten Functions for Node Pool Defaults ---
 
-// flattenNodePoolDefaults: Simplified direct mapping
-func flattenNodePoolDefaults(defaults *container.NodePoolDefaults) []interface{} {
+// Flattens the top-level node_pool_defaults block
+func flattenNodePoolDefaults(defaults *container.NodePoolDefaults) []interface{} { // Assuming API struct name
 	if defaults == nil {
 		return nil
 	}
-	npdData := make(map[string]interface{})
-	hasConfig := false
 
-	// Flatten nested node_config_defaults (simplified)
+	npdData := make(map[string]interface{})
+	hasNonDefaultConfig := false
+
+	// Flatten the nested node_config_defaults block
+	// Assuming API field name is NodeConfigDefaults
 	if flattenedNCD := flattenNodeConfigDefaults(defaults.NodeConfigDefaults); flattenedNCD != nil {
 		npdData["node_config_defaults"] = flattenedNCD
-		hasConfig = true
+		hasNonDefaultConfig = true
 	}
 
-	// Add direct mapping for any other fields directly under node_pool_defaults if they exist in API/schema
+	// Add checks for any other fields directly under node_pool_defaults if they exist in API/schema
 
-	if !hasConfig {
+	if !hasNonDefaultConfig {
 		return nil
-	}
+	} // Nothing non-default in the entire block
 	return []interface{}{npdData}
 }
 
-// flattenNodeConfigDefaults: Simplified direct mapping
-func flattenNodeConfigDefaults(ncd *container.NodeConfigDefaults) []interface{} {
-	// NOTE: The v1.NodeConfigDefaults struct might be minimal or empty.
-	// Need to check the actual API definition for fields.
-	// Example placeholder:
+// Flattens the nested node_config_defaults block, checking internal defaults
+func flattenNodeConfigDefaults(ncd *container.NodeConfigDefaults) []interface{} { // Assuming API struct name
 	if ncd == nil {
 		return nil
 	}
+
 	ncdData := make(map[string]interface{})
+	hasNonDefaultConfig := false // Track if this nested block has anything non-default
 
-	// Example: If NodeConfigDefaults had GcfsConfig field in v1 API
-	// if ncd.GcfsConfig != nil {
-	//     gcfsData := map[string]interface{}{"enabled": ncd.GcfsConfig.Enabled} // Map directly
-	//     ncdData["gcfs_config"] = []interface{}{gcfsData}
-	// }
-	// Add other direct field mappings here based on the actual v1.NodeConfigDefaults struct
+	if !hasNonDefaultConfig {
+		return nil
+	} // Nothing non-default found in node_config_defaults
+	return []interface{}{ncdData}
+}
 
-	if len(ncdData) == 0 {
+// flattenControlPlaneEndpointsConfig: Always include with default values
+func flattenControlPlaneEndpointsConfig(config *container.ControlPlaneEndpointsConfig) []interface{} {
+	result := make(map[string]interface{})
+
+	// DNS Endpoint Config - default to allow_external_traffic = false
+	dnsConfig := make(map[string]interface{})
+	dnsConfig["allow_external_traffic"] = false
+
+	// Override if explicitly set to true
+	if config != nil && config.DnsEndpointConfig != nil && config.DnsEndpointConfig.AllowExternalTraffic {
+		dnsConfig["allow_external_traffic"] = true
+	}
+
+	// Add endpoint if present
+	if config != nil && config.DnsEndpointConfig != nil && config.DnsEndpointConfig.Endpoint != "" {
+		dnsConfig["endpoint"] = config.DnsEndpointConfig.Endpoint
+	}
+
+	result["dns_endpoint_config"] = []interface{}{dnsConfig}
+
+	// IP Endpoints Config - default to enabled = true
+	ipConfig := make(map[string]interface{})
+	ipConfig["enabled"] = true
+
+	// Override if explicitly set to false
+	if config != nil && config.IpEndpointsConfig != nil && !config.IpEndpointsConfig.Enabled {
+		ipConfig["enabled"] = false
+	}
+
+	// Add other fields if present
+	if config != nil && config.IpEndpointsConfig != nil {
+		if config.IpEndpointsConfig.EnablePublicEndpoint {
+			ipConfig["enable_public_endpoint"] = true
+		}
+
+		if config.IpEndpointsConfig.PublicEndpoint != "" {
+			ipConfig["public_endpoint"] = config.IpEndpointsConfig.PublicEndpoint
+		}
+
+		if config.IpEndpointsConfig.PrivateEndpoint != "" {
+			ipConfig["private_endpoint"] = config.IpEndpointsConfig.PrivateEndpoint
+		}
+
+		// Add authorized_networks_config if present
+		if config.IpEndpointsConfig.AuthorizedNetworksConfig != nil {
+			if config.IpEndpointsConfig.AuthorizedNetworksConfig.GcpPublicCidrsAccessEnabled {
+				authConfig := make(map[string]interface{})
+				authConfig["gcp_public_cidrs_access_enabled"] = true
+				ipConfig["authorized_networks_config"] = []interface{}{authConfig}
+			}
+		}
+	}
+
+	result["ip_endpoints_config"] = []interface{}{ipConfig}
+
+	return []interface{}{result}
+}
+
+func flattenNodePoolAutoConfig(c *container.NodePoolAutoConfig) []map[string]interface{} {
+	if c == nil {
 		return nil
 	}
-	return []interface{}{ncdData}
+
+	result := make(map[string]interface{})
+	if c.NodeKubeletConfig != nil {
+		result["node_kubelet_config"] = flattenNodePoolAutoConfigNodeKubeletConfig(c.NodeKubeletConfig)
+	}
+	if c.NetworkTags != nil {
+		result["network_tags"] = flattenNodePoolAutoConfigNetworkTags(c.NetworkTags)
+	}
+	if c.ResourceManagerTags != nil {
+		result["resource_manager_tags"] = flattenResourceManagerTags(c.ResourceManagerTags)
+	}
+	if c.LinuxNodeConfig != nil {
+		result["linux_node_config"] = []map[string]interface{}{
+			{"cgroup_mode": c.LinuxNodeConfig.CgroupMode},
+		}
+	}
+
+	return []map[string]interface{}{result}
+}
+
+func flattenNodePoolAutoConfigNetworkTags(c *container.NetworkTags) []map[string]interface{} {
+	if c == nil {
+		return nil
+	}
+
+	result := make(map[string]interface{})
+	if c.Tags != nil {
+		result["tags"] = c.Tags
+	}
+	return []map[string]interface{}{result}
+}
+
+func flattenNodePoolAutoConfigNodeKubeletConfig(c *container.NodeKubeletConfig) []map[string]interface{} {
+	result := []map[string]interface{}{}
+	if c != nil {
+		result = append(result, map[string]interface{}{
+			"insecure_kubelet_readonly_port_enabled": flattenInsecureKubeletReadonlyPortEnabled(c),
+		})
+	}
+	return result
+}
+
+func flattenResourceManagerTags(c *container.ResourceManagerTags) map[string]interface{} {
+	if c == nil {
+		return nil
+	}
+
+	rmt := make(map[string]interface{})
+
+	for k, v := range c.Tags {
+		rmt[k] = v
+	}
+
+	return rmt
+}
+
+func flattenInsecureKubeletReadonlyPortEnabled(c *container.NodeKubeletConfig) string {
+	// Convert bool from the API to the enum values used internally
+	if c != nil && c.InsecureKubeletReadonlyPortEnabled {
+		return "TRUE"
+	}
+	return "FALSE"
 }
