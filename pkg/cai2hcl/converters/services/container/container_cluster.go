@@ -82,33 +82,17 @@ func (c *ContainerClusterConverter) Convert(asset *caiasset.Asset) ([]*models.Te
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert cluster data: %w", err)
 	}
-	// Allow nil block if conversion results in only defaults (though unlikely for cluster itself)
-	// if clusterBlock == nil && err == nil {
-	// 	return nil, fmt.Errorf("cluster conversion returned nil block without error")
-	// }
 
 	blocks := []*models.TerraformResourceBlock{}
 	if clusterBlock != nil {
 		blocks = append(blocks, clusterBlock)
-	} else {
-		fmt.Printf("Info: Cluster %s resulted in an empty block after omitting defaults.\n", clusterName)
 	}
 
-	// Convert node pools if they exist in the asset and are not just the default pool handled by cluster block
+	// Convert node pools to separate google_container_nood_pool objects,
+	// because cluster's nood_pool prop creates immutable node pools are recreated on import
 	if len(cluster.NodePools) > 0 {
-		// Determine if remove_default_node_pool should be true (implicitly or explicitly)
-		// This logic might need refinement based on how initial_node_count interacts with explicit node pools in the API response.
-		// Simple check: if more than one node pool exists, or if the single existing pool is NOT named "default-pool"
-		hasSeparateNodePools := len(cluster.NodePools) > 1 || (len(cluster.NodePools) == 1 && cluster.NodePools[0] != nil && cluster.NodePools[0].Name != "default-pool")
-
 		for _, nodePool := range cluster.NodePools {
 			if nodePool == nil {
-				continue
-			}
-			// Skip conversion if this looks like the default pool AND we are NOT setting remove_default_node_pool=true
-			isDefaultPool := nodePool.Name == "default-pool" // GKE's default pool name
-			if isDefaultPool && !hasSeparateNodePools && clusterBlock != nil && clusterBlock.Value.GetAttr("remove_default_node_pool").IsNull() {
-				fmt.Printf("Info: Skipping conversion of apparent default node pool '%s' as it's likely managed by cluster block attributes.\n", nodePool.Name)
 				continue
 			}
 
@@ -138,14 +122,13 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 
 	hclData := make(map[string]interface{})
 
-	// Required fields
+	// We should fail if not set
 	hclData["name"] = clusterName
 
-	// Add location field - required field for cluster resource
+	// We should fail if not set
 	hclData["location"] = location
 
-	// Optional fields - only add if non-default / non-empty
-	// Project: Omit if matches provider default (requires provider config access - skip for now)
+	// Project: it could be set in "provider" section, but we should fail if it's not present
 	if project != "" {
 		hclData["project"] = project
 	}
@@ -154,69 +137,47 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 		hclData["description"] = cluster.Description
 	}
 
-	// Conditional logic for initial node pool / remove_default_node_pool
-	// Check if separate node pool resources are expected based on API response structure
+	// From provider "initial_node_count" description:
+	// "Must be set if node_pool is not set.
+	// If you're using google_container_node_pool objects with no default node pool,
+	// you'll need to set this to a value of at least 1, alongside setting remove_default_node_pool to true."
 	hasSeparateNodePools := false
 	if len(nodePools) > 1 || (len(nodePools) == 1 && nodePools[0] != nil && nodePools[0].Name != "default-pool") {
 		hasSeparateNodePools = true
 	}
-	// Scenario 1: Separate node pools exist or will be created
+	// We don't want to support "node_pool" list since node pools are going to be recreated on every change
 	if hasSeparateNodePools {
+		// Scenario 1: Separate node pools exist or will be created
 		hclData["remove_default_node_pool"] = true // Default is false, so set true
-		// Do NOT set initial_node_count or cluster-level node_config
+		hclData["initial_node_count"] = 1          // it's going to be removed so let's set min value
 	} else {
 		// Scenario 2: Only the default node pool exists, manage with cluster block
-		// remove_default_node_pool defaults to false, so omit it.
-		// Set initial_node_count if > 0 (default seems 3, but 0 is valid API value?)
 		if cluster.InitialNodeCount > 0 {
 			hclData["initial_node_count"] = cluster.InitialNodeCount
 		}
-		// Set cluster-level node_config if non-default
+		// Set cluster-level node_config
 		if flattened := flattenNodeConfig(cluster.NodeConfig); flattened != nil {
 			hclData["node_config"] = flattened
+		}
+		// Set node_version from CurrentNodeVersion (as per target schema)
+		if cluster.CurrentNodeVersion != "" {
+			hclData["node_version"] = cluster.CurrentNodeVersion
 		}
 	}
 
 	if cluster.Network != "" {
 		// Use resource name or self-link based on provider preference (using name here)
 		hclData["network"] = tpgresource.GetResourceNameFromSelfLink(cluster.Network)
+	} else if cluster.NetworkConfig != nil && cluster.NetworkConfig.Network != "" {
+		hclData["network"] = cluster.NetworkConfig.Network
 	}
 
 	// Subnetwork: Use full path for subnetwork
-	if cluster.Subnetwork != "" {
-		if project != "" && strings.HasPrefix(cluster.Subnetwork, "projects/") {
-			// If it's already a full path, use it as is
-			hclData["subnetwork"] = cluster.Subnetwork
-		} else if project != "" {
-			// Construct full path if not already present
-			subnetName := tpgresource.GetResourceNameFromSelfLink(cluster.Subnetwork)
-
-			// Extract region from location for subnetwork path
-			region := "us-central1" // Default in case we can't extract from location
-
-			// Extract region based on location format
-			// If location is a zone (e.g., us-central1-a), extract the region part
-			// If location is already a region (e.g., us-central1), use it directly
-			locationParts := strings.Split(location, "-")
-			if len(locationParts) == 3 {
-				// Location is a zone, extract region (e.g., us-central1-a -> us-central1)
-				lastDashIndex := strings.LastIndex(location, "-")
-				if lastDashIndex > 0 {
-					region = location[:lastDashIndex]
-				}
-			} else if len(locationParts) == 2 {
-				// Location is already a region (e.g., us-central1)
-				region = location
-			}
-
-			hclData["subnetwork"] = fmt.Sprintf("projects/%s/regions/%s/subnetworks/%s",
-				project,
-				region,
-				subnetName)
-		} else {
-			// Fallback to just the name if we can't construct full path
-			hclData["subnetwork"] = tpgresource.GetResourceNameFromSelfLink(cluster.Subnetwork)
-		}
+	if cluster.Subnetwork != "" && strings.HasPrefix(cluster.Subnetwork, "projects/") {
+		// If it's already a full path, use it as is
+		hclData["subnetwork"] = cluster.Subnetwork
+	} else if cluster.NetworkConfig != nil && cluster.NetworkConfig.Subnetwork != "" {
+		hclData["subnetwork"] = cluster.NetworkConfig.Subnetwork
 	}
 
 	// IP Allocation Policy
@@ -225,17 +186,22 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 	}
 
 	// Network Config sub-fields (Datapath Provider, boolean flags)
-	if cluster.NetworkConfig != nil { // Check if NetworkConfig exists first
-		// --- Cluster Blocks (Potentially under NetworkConfig) ---
-		if flattened := flattenDnsConfig(cluster.NetworkConfig.DnsConfig); flattened != nil { // Access via NetworkConfig
+	if cluster.NetworkConfig != nil { // Check if NetworkConfig exists first---
+		if flattened := flattenDnsConfig(cluster.NetworkConfig.DnsConfig); flattened != nil {
 			hclData["dns_config"] = flattened
 		}
 		// Corrected field name from ServiceExternalIPsConfig to ServiceExternalIpsConfig
 		if flattened := flattenServiceExternalIPsConfig(cluster.NetworkConfig.ServiceExternalIpsConfig); flattened != nil {
 			hclData["service_external_ips_config"] = flattened
 		}
-		if flattened := flattenGatewayApiConfig(cluster.NetworkConfig.GatewayApiConfig); flattened != nil { // Access via NetworkConfig
+		if flattened := flattenGatewayApiConfig(cluster.NetworkConfig.GatewayApiConfig); flattened != nil {
 			hclData["gateway_api_config"] = flattened
+		}
+		if flattened := flattenDefaultSnatStatus(cluster.NetworkConfig.DefaultSnatStatus); flattened != nil {
+			hclData["default_snat_status"] = flattened
+		}
+		if flattened := flattenAuthenticatorGroupsConfig(cluster.AuthenticatorGroupsConfig); flattened != nil {
+			hclData["authenticator_groups_config"] = flattened
 		}
 
 		// Include if "unspecified" or "legacy"
@@ -250,12 +216,20 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 		if cluster.NetworkConfig.EnableL4ilbSubsetting {
 			hclData["enable_l4_ilb_subsetting"] = true
 		}
+		// disable_l4_lb_firewall_reconciliation: Omit if false (enabled by default)
+		if cluster.NetworkConfig.DisableL4LbFirewallReconciliation {
+			hclData["disable_l4_lb_firewall_reconciliation"] = true
+		}
+		// enable_cilium_clusterwide_network_policy: Omit if false (default)
+		if cluster.NetworkConfig.EnableCiliumClusterwideNetworkPolicy {
+			hclData["enable_cilium_clusterwide_network_policy"] = true
+		}
 		// enable_multi_networking: Omit if false (default)
 		if cluster.NetworkConfig.EnableMultiNetworking {
 			hclData["enable_multi_networking"] = true
 		}
 		// enable_intranode_visibility: Omit if false (default)
-		if cluster.NetworkConfig.EnableIntraNodeVisibility { // Field name from schema
+		if cluster.NetworkConfig.EnableIntraNodeVisibility {
 			hclData["enable_intranode_visibility"] = true
 		}
 	}
@@ -267,6 +241,9 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 
 	// Always include network_policy, will default to disabled with PROVIDER_UNSPECIFIED if not specified
 	hclData["network_policy"] = flattenNetworkPolicy(cluster.NetworkPolicy)
+
+	// Converts only MaintenanceWindow
+	hclData["maintenance_policy"] = flattenMaintenancePolicy(cluster.MaintenancePolicy)
 
 	if cluster.LoggingService != "" {
 		hclData["logging_service"] = cluster.LoggingService
@@ -302,33 +279,45 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 	// Always include release_channel, will default to UNSPECIFIED if not specified
 	hclData["release_channel"] = flattenReleaseChannel(cluster.ReleaseChannel)
 
-	// Set node_version from CurrentNodeVersion (as per target schema)
-	if cluster.CurrentNodeVersion != "" {
-		hclData["node_version"] = cluster.CurrentNodeVersion
-	}
-
-	// master_version not included in target schema, omitting
-
 	// Boolean flags - Omit if default (usually false, check schema)
-	if cluster.Autopilot != nil && cluster.Autopilot.Enabled { // Default false
+	if cluster.Autopilot != nil && cluster.Autopilot.Enabled {
 		hclData["enable_autopilot"] = true
+		if cluster.Autopilot.WorkloadPolicyConfig != nil {
+			hclData["allow_net_admin"] = cluster.Autopilot.WorkloadPolicyConfig.AllowNetAdmin
+		}
 	}
-	if cluster.EnableKubernetesAlpha { // Default false
+
+	if cluster.EnableKubernetesAlpha {
 		hclData["enable_kubernetes_alpha"] = true
 	}
-	if cluster.EnableTpu { // Default false
+
+	if cluster.EnableTpu {
 		hclData["enable_tpu"] = true
 	}
-	if cluster.LegacyAbac != nil && cluster.LegacyAbac.Enabled { // Default false
+
+	if cluster.TpuIpv4CidrBlock != "" {
+		hclData["tpu_ipv4_cidr_block"] = cluster.TpuIpv4CidrBlock
+	}
+
+	if cluster.LegacyAbac != nil && cluster.LegacyAbac.Enabled {
 		hclData["enable_legacy_abac"] = true
 	}
-	// this is true by default
+
 	if cluster.ShieldedNodes != nil {
 		hclData["enable_shielded_nodes"] = cluster.ShieldedNodes.Enabled
 	}
 
+	if cluster.NotificationConfig != nil {
+		hclData["notification_config"] = flattenNotificationConfig(cluster.NotificationConfig)
+	}
+
+	if flattened := flattenConfidentialNodes(cluster.ConfidentialNodes); flattened != nil {
+		hclData["confidential_nodes"] = flattened
+	}
+
 	// --- Cluster Blocks --- Always include master_auth and control_plane_endpoints_config with default values
-	// Always include master_auth block with client_certificate_config.issue_client_certificate = false
+
+	// Contains only issue_client_certificate flag based on ClientCertificate presense
 	hclData["master_auth"] = flattenMasterAuth(cluster.MasterAuth)
 
 	// Always include control_plane_endpoints_config with defaults
@@ -473,7 +462,7 @@ func (c *ContainerClusterConverter) convertNodePoolData(nodePool *container.Node
 	}
 
 	// Upgrade Settings: omit if nil or only contains defaults
-	if flattened := flattenNodePoolUpgradeSettings(nodePool.UpgradeSettings); flattened != nil {
+	if flattened := flattenUpgradeSettings(nodePool.UpgradeSettings); flattened != nil {
 		hclData["upgrade_settings"] = flattened
 	}
 
@@ -576,176 +565,154 @@ func flattenNodeConfig(config *container.NodeConfig) []interface{} {
 	}
 
 	nodeConfig := make(map[string]interface{})
-	hasNonDefaultConfig := false // Track if any non-default value is set
+	// Always include advanced_machine_features with default values
+	nodeConfig["advanced_machine_features"] = flattenAdvancedMachineFeatures(config.AdvancedMachineFeatures)
 
 	// Machine Type: Typically non-default if specified. Include if present.
 	if config.MachineType != "" {
 		// TODO: Check against implicit default like e2-medium? Hard to determine.
 		nodeConfig["machine_type"] = config.MachineType
-		hasNonDefaultConfig = true
 	}
 
 	if config.DiskSizeGb > 0 { // Keep basic check for >0, as 0 might be invalid
 		nodeConfig["disk_size_gb"] = config.DiskSizeGb
-		hasNonDefaultConfig = true
 	}
 
 	// Disk Type: Don't check on 'pd-standard' default.
 	if config.DiskType != "" {
 		nodeConfig["disk_type"] = config.DiskType
-		hasNonDefaultConfig = true
 	}
 
 	// OAuth Scopes: Omit only if list is empty (simplification, actual defaults are complex).
 	if len(config.OauthScopes) > 0 {
-		// TODO: Consider comparing against expected default scopes for the SA? Very complex.
 		nodeConfig["oauth_scopes"] = config.OauthScopes
-		hasNonDefaultConfig = true
 	}
 
 	// Service Account: dont check on "default" SA.
 	if config.ServiceAccount != "" {
 		nodeConfig["service_account"] = config.ServiceAccount
-		hasNonDefaultConfig = true
 	}
 
 	// Metadata: Omit if explicitly empty. GKE adds defaults, difficult to filter precisely.
 	if len(config.Metadata) > 0 {
 		nodeConfig["metadata"] = config.Metadata
-		hasNonDefaultConfig = true
 	}
 
-	// Image Type: dont check on assumed default (COS_CONTAINERD).
+	// Image Type: default is COS_CONTAINERD but we set it anyway.
 	if config.ImageType != "" {
 		nodeConfig["image_type"] = config.ImageType
-		hasNonDefaultConfig = true
 	}
 
-	// Labels: Omit if empty map.
 	if len(config.Labels) > 0 {
 		nodeConfig["labels"] = config.Labels
-		hasNonDefaultConfig = true
 	}
 
-	// Resource Labels: Omit if empty map. (Field name might differ in v1 struct)
 	if len(config.ResourceLabels) > 0 {
 		nodeConfig["resource_labels"] = config.ResourceLabels
-		hasNonDefaultConfig = true
 	}
 
-	// Local SSD Count: Default 0. Omit if 0.
 	if config.LocalSsdCount > 0 {
 		nodeConfig["local_ssd_count"] = config.LocalSsdCount
-		hasNonDefaultConfig = true
 	}
 
-	// Tags: Omit if empty list.
 	if len(config.Tags) > 0 {
 		nodeConfig["tags"] = config.Tags
-		hasNonDefaultConfig = true
 	}
 
-	// Preemptible: Default false. Omit if false.
 	if config.Preemptible {
 		nodeConfig["preemptible"] = config.Preemptible
-		hasNonDefaultConfig = true
 	}
 
-	// Spot: Default false. Omit if false.
 	if config.Spot {
 		nodeConfig["spot"] = config.Spot
-		hasNonDefaultConfig = true
 	}
 
-	// Min CPU Platform: Default "". Omit if "".
 	if config.MinCpuPlatform != "" {
 		nodeConfig["min_cpu_platform"] = config.MinCpuPlatform
-		hasNonDefaultConfig = true
 	}
 
-	// --- Nested Blocks --- Check if flatten returns non-nil
+	if len(config.StoragePools) > 0 {
+		nodeConfig["storage_pools"] = config.StoragePools
+	}
+
+	if config.FlexStart {
+		nodeConfig["flex_start"] = config.FlexStart
+	}
+
+	if config.NodeGroup != "" {
+		nodeConfig["node_group"] = config.NodeGroup
+	}
+
+	if config.EnableConfidentialStorage {
+		nodeConfig["enable_confidential_storage"] = true
+	}
+
+	if config.LocalSsdEncryptionMode != "" {
+		nodeConfig["local_ssd_encryption_mode"] = config.LocalSsdEncryptionMode
+	}
+
+	if config.MaxRunDuration != "" {
+		nodeConfig["max_run_duration"] = config.MaxRunDuration
+	}
+
+	if config.BootDiskKmsKey != "" {
+		nodeConfig["boot_disk_kms_key"] = config.BootDiskKmsKey
+	}
+
+	// --- Nested Blocks ---
 	if flattened := flattenWorkloadMetadataConfig(config.WorkloadMetadataConfig); flattened != nil {
 		nodeConfig["workload_metadata_config"] = flattened
-		hasNonDefaultConfig = true
 	}
 	if flattened := flattenShieldedInstanceConfig(config.ShieldedInstanceConfig); flattened != nil {
 		nodeConfig["shielded_instance_config"] = flattened
-		hasNonDefaultConfig = true
 	}
 	if flattened := flattenAccelerators(config.Accelerators); flattened != nil {
 		nodeConfig["guest_accelerator"] = flattened // TF uses guest_accelerator
-		hasNonDefaultConfig = true
 	}
 	if flattened := flattenReservationAffinity(config.ReservationAffinity); flattened != nil {
 		nodeConfig["reservation_affinity"] = flattened
-		hasNonDefaultConfig = true
-	}
-	if flattened := flattenConfidentialNodes(config.ConfidentialNodes); flattened != nil {
-		nodeConfig["confidential_nodes"] = flattened
-		hasNonDefaultConfig = true
 	}
 	if flattened := flattenKubeletConfig(config.KubeletConfig); flattened != nil {
 		nodeConfig["kubelet_config"] = flattened
-		hasNonDefaultConfig = true
 	}
 	if flattened := flattenLinuxNodeConfig(config.LinuxNodeConfig); flattened != nil {
 		nodeConfig["linux_node_config"] = flattened
-		hasNonDefaultConfig = true
 	}
-	if flattened := flattenGvnic(config.Gvnic); flattened != nil { // Assuming flattenGvnic helper exists
+	if flattened := flattenGvnic(config.Gvnic); flattened != nil {
 		nodeConfig["gvnic"] = flattened
-		hasNonDefaultConfig = true
 	}
-
-	// Always include advanced_machine_features with default values
-	nodeConfig["advanced_machine_features"] = flattenAdvancedMachineFeatures(config.AdvancedMachineFeatures)
-	hasNonDefaultConfig = true
-	// Add other nested blocks (EphemeralStorage, Nvme, SecondaryDisks, Gcfs, Windows, SoleTenant, HostMaintenance, FastSocket etc.)
-	// Example:
-	// if flattened := flattenEphemeralStorage(config.EphemeralStorageLocalSsdConfig); flattened != nil {
-	//  nodeConfig["ephemeral_storage_local_ssd_config"] = flattened
-	//  hasNonDefaultConfig = true
-	// }
-
-	// --- Simple Optional Fields --- Omit if zero value / empty
-	if config.BootDiskKmsKey != "" {
-		nodeConfig["boot_disk_kms_key"] = config.BootDiskKmsKey
-		hasNonDefaultConfig = true
+	if flattened := flattenSoleTenantConfig(config.SoleTenantConfig); flattened != nil {
+		nodeConfig["sole_tenant_config"] = flattened
+	}
+	if flattened := flattenFastSocket(config.FastSocket); flattened != nil {
+		nodeConfig["fast_socket"] = flattened
+	}
+	if flattened := flattenWindowsNodeConfig(config.WindowsNodeConfig); flattened != nil {
+		nodeConfig["windows_node_config"] = flattened
+	}
+	if flattened := flattenSecondaryBootDisks(config.SecondaryBootDisks); flattened != nil {
+		nodeConfig["secondary_boot_disks"] = flattened
+	}
+	if flattened := flattenGcfsConfig(config.GcfsConfig); flattened != nil {
+		nodeConfig["gcfs_config"] = flattened
 	}
 
 	// Taints: flattenNodeTaints handles empty list.
 	if flattened := flattenNodeTaints(config.Taints); flattened != nil {
-		nodeConfig["taint"] = flattened // TF uses taint
-		hasNonDefaultConfig = true
+		nodeConfig["taint"] = flattened
+	}
+
+	if flattened := flattenNodeTaints(config.Taints); flattened != nil {
+		nodeConfig["taint"] = flattened
 	}
 
 	// resource_manager_tags: Always include empty map as default
 	if config.ResourceManagerTags != nil && len(config.ResourceManagerTags.Tags) > 0 {
-		nodeConfig["resource_manager_tags"] = config.ResourceManagerTags.Tags // Assign the actual map
+		nodeConfig["resource_manager_tags"] = config.ResourceManagerTags.Tags
 	} else {
-		nodeConfig["resource_manager_tags"] = make(map[string]string) // Empty map as default
-	}
-	hasNonDefaultConfig = true
-	// enable_confidential_storage: Omit if false (default)
-	if config.EnableConfidentialStorage { // Assuming field name and bool type
-		nodeConfig["enable_confidential_storage"] = true
-		hasNonDefaultConfig = true
-	}
-	// local_ssd_encryption_mode: Omit if empty or default ("STANDARD_ENCRYPTION"?)
-	localSsdEncryptDefault := "STANDARD_ENCRYPTION"                                                     // Verify
-	if config.LocalSsdEncryptionMode != "" && config.LocalSsdEncryptionMode != localSsdEncryptDefault { // Assuming field name
-		nodeConfig["local_ssd_encryption_mode"] = config.LocalSsdEncryptionMode
-		hasNonDefaultConfig = true
-	}
-	// max_run_duration: Omit if empty
-	if config.MaxRunDuration != "" { // Assuming field name
-		nodeConfig["max_run_duration"] = config.MaxRunDuration
-		hasNonDefaultConfig = true
+		nodeConfig["resource_manager_tags"] = make(map[string]string)
 	}
 
-	if !hasNonDefaultConfig { // If NO non-default values were added
-		return nil // Omit the entire node_config block
-	}
 	return []interface{}{nodeConfig}
 }
 
@@ -795,33 +762,26 @@ func flattenAccelerators(accelerators []*container.AcceleratorConfig) []interfac
 			continue
 		}
 
+		hasMeaningfulAccelerator = true
 		data := make(map[string]interface{})
-		accHasNonDefaultConfig := false
 
 		// Count and Type are required by schema if block present. Always include if acc exists.
 		// Assuming keys match the map structure expected by the caller (flattenNodeConfig -> guest_accelerator)
 		data["accelerator_type"] = acc.AcceleratorType
 		data["accelerator_count"] = acc.AcceleratorCount
-		accHasNonDefaultConfig = true // Presence of type/count makes it non-default
 
 		// Optional fields - add only if present AND potentially non-default
 		if acc.GpuPartitionSize != "" {
 			data["gpu_partition_size"] = acc.GpuPartitionSize
-			accHasNonDefaultConfig = true
 		}
 		if flattened := flattenGpuSharingConfig(acc.GpuSharingConfig); flattened != nil {
 			data["gpu_sharing_config"] = flattened
-			accHasNonDefaultConfig = true
 		}
 		if flattened := flattenGpuDriverInstallationConfig(acc.GpuDriverInstallationConfig); flattened != nil {
 			data["gpu_driver_installation_config"] = flattened
-			accHasNonDefaultConfig = true
 		}
 
-		if accHasNonDefaultConfig { // Should always be true if acc != nil due to type/count
-			result = append(result, data)
-			hasMeaningfulAccelerator = true
-		}
+		result = append(result, data)
 	}
 
 	if !hasMeaningfulAccelerator { // If all acc were nil or somehow deemed default
@@ -830,32 +790,27 @@ func flattenAccelerators(accelerators []*container.AcceleratorConfig) []interfac
 	return result
 }
 
-// flattenGpuSharingConfig: Omit fields if default. Return nil if block empty/default.
+// flattenGpuSharingConfig: Omit block if config is nil or if either required field
+// (max_shared_clients_per_gpu or gpu_sharing_strategy) is missing or default.
 func flattenGpuSharingConfig(config *container.GPUSharingConfig) []interface{} {
 	if config == nil {
 		return nil
 	}
+
+	// Check if required fields have valid, non-default values.
+	if config.MaxSharedClientsPerGpu <= 0 {
+		return nil
+	}
+	// Strategy must be non-empty and not the default unspecified value.
+	if config.GpuSharingStrategy == "" || config.GpuSharingStrategy == "GPU_SHARING_STRATEGY_UNSPECIFIED" {
+		return nil
+	}
+
+	// Both required fields are present and valid, create the block.
 	data := make(map[string]interface{})
-	hasNonDefaultConfig := false
+	data["max_shared_clients_per_gpu"] = config.MaxSharedClientsPerGpu
+	data["gpu_sharing_strategy"] = config.GpuSharingStrategy
 
-	// Max clients required by schema if block present
-	if config.MaxSharedClientsPerGpu > 0 { // Assume 0 is default/invalid? Schema needs check. Let's include if > 0.
-		data["max_shared_clients_per_gpu"] = config.MaxSharedClientsPerGpu
-		hasNonDefaultConfig = true
-	} else {
-		// If max_shared_clients is required and <= 0, maybe the block is invalid?
-		// For now, let's assume the block can exist without it if strategy is set.
-	}
-
-	// Strategy: Omit if default (UNSPECIFIED)
-	if config.GpuSharingStrategy != "" && config.GpuSharingStrategy != "GPU_SHARING_STRATEGY_UNSPECIFIED" {
-		data["gpu_sharing_strategy"] = config.GpuSharingStrategy
-		hasNonDefaultConfig = true
-	}
-
-	if !hasNonDefaultConfig {
-		return nil // Only contained defaults or was invalid
-	}
 	return []interface{}{data}
 }
 
@@ -868,23 +823,20 @@ func flattenGpuDriverInstallationConfig(config *container.GPUDriverInstallationC
 	return []interface{}{map[string]interface{}{"gpu_driver_version": config.GpuDriverVersion}}
 }
 
+// flattenReservationAffinity: Omit block if type is unspecified
 func flattenReservationAffinity(config *container.ReservationAffinity) []interface{} {
-	if config == nil {
+	if config == nil || config.ConsumeReservationType == "" {
 		return nil
-	}
-	// Map type directly, do not check against "NO_RESERVATION" or "UNSPECIFIED"
-	if config.ConsumeReservationType == "" {
-		return nil // Omit block if type is default/unspecified
 	}
 
 	ra := make(map[string]interface{})
-	ra["consume_reservation_type"] = config.ConsumeReservationType // Set non-default type
+	ra["consume_reservation_type"] = config.ConsumeReservationType
 
 	if config.ConsumeReservationType == "SPECIFIC_RESERVATION" {
 		if config.Key != "" {
 			ra["key"] = config.Key
 		} else {
-			fmt.Printf("Warning: ReservationAffinity type is SPECIFIC_RESERVATION but Key is missing. Omitting block.\n")
+			// should not happen
 			return nil
 		}
 		if len(config.Values) > 0 {
@@ -896,7 +848,7 @@ func flattenReservationAffinity(config *container.ReservationAffinity) []interfa
 
 // flattenConfidentialNodes: Omit if default (enabled: false).
 func flattenConfidentialNodes(config *container.ConfidentialNodes) []interface{} {
-	if config == nil || !config.Enabled { // Default is false
+	if config == nil || !config.Enabled {
 		return nil
 	}
 	return []interface{}{map[string]interface{}{"enabled": true}}
@@ -931,12 +883,39 @@ func flattenKubeletConfig(config *container.NodeKubeletConfig) []interface{} {
 		kc["cpu_cfs_quota_period"] = config.CpuCfsQuotaPeriod
 		hasNonDefaultConfig = true
 	}
-	if config.PodPidsLimit != 0 { // Default is 0 / unset
+	if config.PodPidsLimit > 0 {
 		kc["pod_pids_limit"] = config.PodPidsLimit
 		hasNonDefaultConfig = true
 	}
 
-	// TODO: Add checks for container log/image GC fields against their defaults if known
+	if config.ContainerLogMaxSize != "" {
+		kc["container_log_max_size"] = config.ContainerLogMaxSize
+		hasNonDefaultConfig = true
+	}
+	if config.ContainerLogMaxFiles > 0 {
+		kc["container_log_max_files"] = config.ContainerLogMaxFiles
+	}
+	if config.ImageGcLowThresholdPercent > 0 {
+		kc["image_gc_low_threshold_percent"] = config.ImageGcLowThresholdPercent
+		hasNonDefaultConfig = true
+	}
+	if config.ImageGcHighThresholdPercent > 0 {
+		kc["image_gc_high_threshold_percent"] = config.ImageGcHighThresholdPercent
+		hasNonDefaultConfig = true
+	}
+	if config.ImageMinimumGcAge != "" {
+		kc["image_minimum_gc_age"] = config.ImageMinimumGcAge
+		hasNonDefaultConfig = true
+	}
+	if config.ImageMaximumGcAge != "" {
+		kc["image_maximum_gc_age"] = config.ImageMaximumGcAge
+		hasNonDefaultConfig = true
+	}
+
+	if len(config.AllowedUnsafeSysctls) > 0 {
+		kc["allowed_unsafe_sysctls"] = config.AllowedUnsafeSysctls
+		hasNonDefaultConfig = true
+	}
 
 	if !hasNonDefaultConfig {
 		return nil
@@ -952,22 +931,49 @@ func flattenLinuxNodeConfig(config *container.LinuxNodeConfig) []interface{} {
 	lnc := make(map[string]interface{})
 	hasNonDefaultConfig := false
 
-	// Default sysctls: nil/empty map
 	if len(config.Sysctls) > 0 {
 		lnc["sysctls"] = config.Sysctls
 		hasNonDefaultConfig = true
 	}
-	// Do not check against "GROUP_MODE_V1" or "UNSPECIFIED"
+
 	if config.CgroupMode != "" {
 		lnc["cgroup_mode"] = config.CgroupMode
 		hasNonDefaultConfig = true
 	}
-	// TODO: Check hugepages_config against default (likely all 0)
+
+	if config.Hugepages != nil {
+		lnc["hugepages_config"] = flattenHugepagesConfig(config.Hugepages)
+		hasNonDefaultConfig = true
+	}
 
 	if !hasNonDefaultConfig {
 		return nil
 	}
 	return []interface{}{lnc}
+}
+
+// flattenHugepagesConfig: Omit fields if 0 (default). Return nil if block becomes empty.
+func flattenHugepagesConfig(c *container.HugepagesConfig) []interface{} { // Changed return type
+	if c == nil {
+		return nil
+	}
+	hc := make(map[string]interface{}) // Initialize a single map
+
+	// Include only if value is positive (non-default)
+	if c.HugepageSize1g > 0 {
+		hc["hugepage_size_1g"] = c.HugepageSize1g
+	}
+	if c.HugepageSize2m > 0 {
+		hc["hugepage_size_2m"] = c.HugepageSize2m
+	}
+
+	// If the map is empty after checking fields, omit the block entirely
+	if len(hc) == 0 {
+		return nil
+	}
+
+	// Return the map wrapped in a slice, consistent with other single blocks
+	return []interface{}{hc}
 }
 
 // flattenNodeTaints: Already handles empty list and invalid effect. No change needed.
@@ -981,7 +987,6 @@ func flattenNodeTaints(taints []*container.NodeTaint) []interface{} {
 			continue
 		}
 		if taint.Effect == "" || taint.Effect == "EFFECT_UNSPECIFIED" {
-			// fmt.Printf("Warning: Skipping taint with key %s due to unspecified effect.\n", taint.Key)
 			continue // Skip invalid/default effect
 		}
 		t := make(map[string]interface{})
@@ -996,15 +1001,103 @@ func flattenNodeTaints(taints []*container.NodeTaint) []interface{} {
 	return result
 }
 
-// flattenGvnic: Omit if default (enabled: false).
 func flattenGvnic(config *container.VirtualNIC) []interface{} {
-	if config == nil || !config.Enabled { // Default enabled: false
+	if config == nil || !config.Enabled {
 		return nil
 	}
 	return []interface{}{map[string]interface{}{"enabled": true}}
 }
 
-// flattenIPAllocationPolicy: Omit fields if default, return nil if block becomes empty.
+func flattenGcfsConfig(config *container.GcfsConfig) []interface{} {
+	if config == nil || !config.Enabled {
+		return nil
+	}
+	return []interface{}{map[string]interface{}{"enabled": true}}
+}
+
+func flattenSoleTenantConfig(c *container.SoleTenantConfig) []map[string]interface{} {
+	if c == nil {
+		return nil
+	}
+	result := []map[string]interface{}{}
+	affinities := []map[string]interface{}{}
+	for _, affinity := range c.NodeAffinities {
+		if affinity.Key != "" && affinity.Operator != "" && len(affinity.Values) > 0 {
+			affinities = append(affinities, map[string]interface{}{
+				"key":      affinity.Key,
+				"operator": affinity.Operator,
+				"values":   affinity.Values,
+			})
+		}
+	}
+	if len(affinities) == 0 {
+		return nil
+	}
+	return append(result, map[string]interface{}{
+		"node_affinity": affinities,
+	})
+}
+
+func flattenFastSocket(c *container.FastSocket) []map[string]interface{} {
+	if c == nil || !c.Enabled {
+		return nil
+	}
+	result := []map[string]interface{}{}
+	result = append(result, map[string]interface{}{
+		"enabled": c.Enabled,
+	})
+	return result
+}
+
+func flattenWindowsNodeConfig(c *container.WindowsNodeConfig) []map[string]interface{} {
+	if c == nil || c.OsVersion == "" { // empty block is not supported
+		return nil
+	}
+	result := []map[string]interface{}{}
+	result = append(result, map[string]interface{}{
+		"osversion": c.OsVersion,
+	})
+	return result
+}
+
+func flattenSecondaryBootDisks(c []*container.SecondaryBootDisk) []map[string]interface{} {
+	if c == nil {
+		return nil
+	}
+	sbd := []map[string]interface{}{}
+	for _, disk := range c {
+		if disk.DiskImage == "" {
+			continue
+		}
+		secondaryBootDisk := map[string]interface{}{
+			"disk_image": disk.DiskImage,
+		}
+		if disk.Mode != "" {
+			secondaryBootDisk["mode"] = disk.Mode
+		}
+		sbd = append(sbd, secondaryBootDisk)
+	}
+	if len(sbd) == 0 {
+		return nil
+	}
+	return sbd
+}
+
+func flattenEphemeralStorageLocalSsdConfig(c *container.EphemeralStorageLocalSsdConfig) []interface{} {
+	if c == nil || c.LocalSsdCount <= 0 {
+		return nil
+	}
+
+	data := make(map[string]interface{})
+	data["local_ssd_count"] = c.LocalSsdCount
+
+	if c.DataCacheCount > 0 {
+		data["data_cache_count"] = c.DataCacheCount
+	}
+
+	return []interface{}{data}
+}
+
 func flattenIPAllocationPolicy(policy *container.IPAllocationPolicy) []interface{} {
 	if policy == nil {
 		return nil
@@ -1170,29 +1263,22 @@ func flattenAddonsConfig(config *container.AddonsConfig) []interface{} {
 	return []interface{}{addons}
 }
 
-// flattenNetworkPolicy: Omit if nil or disabled (default). Check provider default.
-func flattenNetworkPolicy(policy *container.NetworkPolicy) []interface{} {
-	// Create data map for network policy
-	data := make(map[string]interface{})
-
-	// If policy is nil or not enabled, return default values
-	if policy == nil || !policy.Enabled {
-		data["enabled"] = false
-		data["provider"] = "PROVIDER_UNSPECIFIED"
-		return []interface{}{data}
-	}
-
-	// Policy is enabled
-	data["enabled"] = true
-
-	// Set provider, default to PROVIDER_UNSPECIFIED if not set
-	if policy.Provider != "" {
-		data["provider"] = policy.Provider
+// flattenNetworkPolicy: set provider default.
+func flattenNetworkPolicy(c *container.NetworkPolicy) []map[string]interface{} {
+	result := []map[string]interface{}{}
+	if c != nil {
+		result = append(result, map[string]interface{}{
+			"enabled":  c.Enabled,
+			"provider": c.Provider,
+		})
 	} else {
-		data["provider"] = "PROVIDER_UNSPECIFIED"
+		// Explicitly set the network policy to the default.
+		result = append(result, map[string]interface{}{
+			"enabled":  false,
+			"provider": "PROVIDER_UNSPECIFIED",
+		})
 	}
-
-	return []interface{}{data}
+	return result
 }
 
 // flattenNodePoolAutoscaling: Omit fields if default. Block required if autoscaling enabled.
@@ -1258,8 +1344,8 @@ func flattenNodeManagement(mgmt *container.NodeManagement) []interface{} {
 	return []interface{}{data}
 }
 
-// flattenNodePoolUpgradeSettings: Omit fields if default. Check max_surge/unavailable defaults (often 1/0?).
-func flattenNodePoolUpgradeSettings(settings *container.UpgradeSettings) []interface{} {
+// flattenUpgradeSettings: Omit fields if default. Check max_surge/unavailable defaults (often 1/0?).
+func flattenUpgradeSettings(settings *container.UpgradeSettings) []interface{} {
 	if settings == nil {
 		return nil
 	}
@@ -1483,7 +1569,34 @@ func flattenPlacementPolicy(policy *container.PlacementPolicy) []interface{} {
 	return []interface{}{data}
 }
 
-// flattenMasterAuth: Always include client_certificate_config with default issue_client_certificate = false
+// flattenNotificationConfig: If the config or the nested Pubsub config is nil, omit the block.
+func flattenNotificationConfig(c *container.NotificationConfig) []map[string]interface{} {
+	if c == nil || c.Pubsub == nil || c.Pubsub.Topic == "" {
+		return nil
+	}
+
+	// Topic is required if pubsub block is present
+	pubsubData := map[string]interface{}{
+		"enabled": c.Pubsub.Enabled,
+		"topic":   c.Pubsub.Topic,
+	}
+
+	// Add the filter block only if it exists and has event types defined
+	if c.Pubsub.Filter != nil && len(c.Pubsub.Filter.EventType) > 0 {
+		filterData := map[string]interface{}{
+			"event_type": c.Pubsub.Filter.EventType,
+		}
+		pubsubData["filter"] = []map[string]interface{}{filterData}
+	}
+
+	return []map[string]interface{}{
+		{
+			"pubsub": []map[string]interface{}{pubsubData},
+		},
+	}
+}
+
+// flattenMasterAuth: Always include client_certificate_config
 func flattenMasterAuth(auth *container.MasterAuth) []interface{} {
 	// Create default master_auth block
 	ma := make(map[string]interface{})
@@ -1491,12 +1604,12 @@ func flattenMasterAuth(auth *container.MasterAuth) []interface{} {
 	// Create client_certificate_config block
 	ccc := make(map[string]interface{})
 
-	// Default to issue_client_certificate = false
+	// Default value
 	ccc["issue_client_certificate"] = false
 
 	// Override if explicitly set to true
 	if auth != nil && auth.ClientCertificateConfig != nil && auth.ClientCertificateConfig.IssueClientCertificate {
-		ccc["issue_client_certificate"] = true
+		ccc["issue_client_certificate"] = len(auth.ClientCertificate) != 0
 	}
 
 	// Add client_certificate_config to master_auth
@@ -1677,59 +1790,30 @@ func flattenMonitoringConfig(config *container.MonitoringConfig) []interface{} {
 
 // flattenClusterAutoscaling: Omit fields if default. Nil if block empty/default.
 func flattenClusterAutoscaling(autoscaling *container.ClusterAutoscaling) []interface{} {
-	if autoscaling == nil {
+	if autoscaling == nil || !autoscaling.EnableNodeAutoprovisioning {
 		return nil
 	}
 
 	ca := make(map[string]interface{})
-	hasNonDefaultConfig := false // Keep this flag to decide if the block itself should be returned
-
+	ca["enabled"] = autoscaling.EnableNodeAutoprovisioning
 	// Autoscaling Profile: Default "BALANCED". Omit if matches.
-
-	// TODO: Verify correct field name for AutoscalingProfile in v1 API or update dependency. Assume field exists.
-	// The code using autoscalingProfileDefault remains commented out, so the variable is unused.
-	/*
-		if autoscaling.AutoscalingProfile != "" && autoscaling.AutoscalingProfile != "PROFILE_UNSPECIFIED" && autoscaling.AutoscalingProfile != "BALANCED" { // Assuming "BALANCED" is the default to compare against
-		    ca["autoscaling_profile"] = autoscaling.AutoscalingProfile
-		    hasNonDefaultConfig = true
-		}
-	*/
-
-	// Node Autoprovisioning section
-	napConfigSet := false
-	if len(autoscaling.AutoprovisioningLocations) > 0 {
-		napConfigSet = true
+	if autoscaling.AutoscalingProfile != "" && autoscaling.AutoscalingProfile != "PROFILE_UNSPECIFIED" && autoscaling.AutoscalingProfile != "BALANCED" {
+		ca["autoscaling_profile"] = autoscaling.AutoscalingProfile
 	}
+
+	if len(autoscaling.AutoprovisioningLocations) > 0 {
+		ca["autoprovisioning_locations"] = autoscaling.AutoprovisioningLocations
+	}
+
 	resourceLimitsBlock := flattenResourceLimits(autoscaling.ResourceLimits)
 	if resourceLimitsBlock != nil {
-		napConfigSet = true
+		ca["resource_limits"] = resourceLimitsBlock
 	}
-	autoProvDefaultsBlock := flattenAutoprovisioningNodePoolDefaults(autoscaling.AutoprovisioningNodePoolDefaults)
+
+	autoProvDefaultsBlock := flattenAutoprovisioningDefaults(autoscaling.AutoprovisioningNodePoolDefaults)
 	if autoProvDefaultsBlock != nil {
-		napConfigSet = true
+		ca["autoprovisioning_node_pool_defaults"] = autoProvDefaultsBlock
 	}
-
-	if autoscaling.EnableNodeAutoprovisioning || napConfigSet { // Include if enabled OR if sub-configs exist
-		ca["enabled"] = autoscaling.EnableNodeAutoprovisioning
-		hasNonDefaultConfig = true // Mark non-default if NAP section is included
-
-		if len(autoscaling.AutoprovisioningLocations) > 0 {
-			ca["autoprovisioning_locations"] = autoscaling.AutoprovisioningLocations
-		}
-		if resourceLimitsBlock != nil {
-			ca["resource_limits"] = resourceLimitsBlock
-		}
-		if autoProvDefaultsBlock != nil {
-			ca["autoprovisioning_node_pool_defaults"] = autoProvDefaultsBlock
-		}
-		if !autoscaling.EnableNodeAutoprovisioning && napConfigSet {
-			ca["enabled"] = false
-		}
-	}
-
-	if !hasNonDefaultConfig {
-		return nil
-	} // Omit if profile is default AND NAP is disabled with no sub-configs
 	return []interface{}{ca}
 }
 
@@ -1744,12 +1828,10 @@ func flattenResourceLimits(limits []*container.ResourceLimit) []interface{} {
 			continue
 		}
 		l := make(map[string]interface{})
-		// resource_type is required
 		if limit.ResourceType == "" {
 			continue
-		} // Skip invalid limit
+		}
 		l["resource_type"] = limit.ResourceType
-		// Min/Max: Omit if 0? Schema requires max, allows optional min.
 		if limit.Minimum != 0 { // Omit if default (0)
 			l["minimum"] = limit.Minimum
 		}
@@ -1768,8 +1850,8 @@ func flattenResourceLimits(limits []*container.ResourceLimit) []interface{} {
 	return result
 }
 
-// flattenAutoprovisioningNodePoolDefaults: Omit fields if default. Nil if block empty.
-func flattenAutoprovisioningNodePoolDefaults(defaults *container.AutoprovisioningNodePoolDefaults) []interface{} {
+// flattenAutoprovisioningDefaults: Omit fields if default. Nil if block empty.
+func flattenAutoprovisioningDefaults(defaults *container.AutoprovisioningNodePoolDefaults) []interface{} {
 	if defaults == nil {
 		return nil
 	}
@@ -1788,7 +1870,7 @@ func flattenAutoprovisioningNodePoolDefaults(defaults *container.Autoprovisionin
 		hasNonDefaultConfig = true
 	}
 	// UpgradeSettings: Omit if nil/default
-	if us := flattenNodePoolUpgradeSettings(defaults.UpgradeSettings); us != nil {
+	if us := flattenUpgradeSettings(defaults.UpgradeSettings); us != nil {
 		data["upgrade_settings"] = us
 		hasNonDefaultConfig = true
 	}
@@ -1953,8 +2035,11 @@ func flattenDnsConfig(dns *container.DNSConfig) []interface{} {
 		data["cluster_dns_domain"] = dns.ClusterDnsDomain
 		hasNonDefaultConfig = true
 	}
-	// TODO: Verify AdditiveVpcScopeDnsDomain in API/TF Schema. Omit if empty.
-	// if dns.AdditiveVpcScopeDnsDomain != "" { data["additive_vpc_scope_dns_domain"] = dns.AdditiveVpcScopeDnsDomain; hasNonDefaultConfig = true }
+	// additive_vpc_scope_dns_domain: Omit if empty.
+	if dns.AdditiveVpcScopeDnsDomain != "" {
+		data[""] = dns.AdditiveVpcScopeDnsDomain
+		hasNonDefaultConfig = true
+	}
 
 	if !hasNonDefaultConfig {
 		return nil
@@ -2085,6 +2170,18 @@ func flattenGatewayApiConfig(gac *container.GatewayAPIConfig) []interface{} {
 	return []interface{}{map[string]interface{}{"channel": gac.Channel}}
 }
 
+// flattenDefaultSnatStatus: Returns flag as false if not disabled
+func flattenDefaultSnatStatus(c *container.DefaultSnatStatus) []map[string]interface{} {
+	if c == nil || !c.Disabled {
+		return nil
+	}
+	return []map[string]interface{}{
+		{
+			"disabled": c.Disabled,
+		},
+	}
+}
+
 // flattenFleet: Fleet configuration for the cluster
 func flattenFleet(c *container.Fleet) []map[string]interface{} {
 	if c == nil {
@@ -2142,6 +2239,17 @@ func flattenNodeConfigDefaults(ncd *container.NodeConfigDefaults) []interface{} 
 		return nil
 	} // Nothing non-default found in node_config_defaults
 	return []interface{}{ncdData}
+}
+
+func flattenAuthenticatorGroupsConfig(c *container.AuthenticatorGroupsConfig) []map[string]interface{} {
+	if c == nil || c.SecurityGroup == "" {
+		return nil
+	}
+	return []map[string]interface{}{
+		{
+			"security_group": c.SecurityGroup,
+		},
+	}
 }
 
 // flattenControlPlaneEndpointsConfig: Always include with default values
@@ -2268,4 +2376,65 @@ func flattenInsecureKubeletReadonlyPortEnabled(c *container.NodeKubeletConfig) s
 		return "TRUE"
 	}
 	return "FALSE"
+}
+
+func flattenMaintenancePolicy(mp *container.MaintenancePolicy) []map[string]interface{} {
+	if mp == nil || mp.Window == nil {
+		return nil
+	}
+
+	exclusions := []map[string]interface{}{}
+	if mp.Window.MaintenanceExclusions != nil {
+		for wName, window := range mp.Window.MaintenanceExclusions {
+			exclusion := map[string]interface{}{
+				"start_time":     window.StartTime,
+				"end_time":       window.EndTime,
+				"exclusion_name": wName,
+			}
+			if window.MaintenanceExclusionOptions != nil {
+				// When the scope is set to NO_UPGRADES which is the default value,
+				// the maintenance exclusion returned by GCP will be empty.
+				// This seems like a bug. To workaround this, assign NO_UPGRADES to the scope explicitly
+				scope := "NO_UPGRADES"
+				if window.MaintenanceExclusionOptions.Scope != "" {
+					scope = window.MaintenanceExclusionOptions.Scope
+				}
+				exclusion["exclusion_options"] = []map[string]interface{}{
+					{
+						"scope": scope,
+					},
+				}
+			}
+			exclusions = append(exclusions, exclusion)
+		}
+	}
+
+	if mp.Window.DailyMaintenanceWindow != nil {
+		return []map[string]interface{}{
+			{
+				"daily_maintenance_window": []map[string]interface{}{
+					{
+						"start_time": mp.Window.DailyMaintenanceWindow.StartTime,
+						"duration":   mp.Window.DailyMaintenanceWindow.Duration,
+					},
+				},
+				"maintenance_exclusion": exclusions,
+			},
+		}
+	}
+	if mp.Window.RecurringWindow != nil {
+		return []map[string]interface{}{
+			{
+				"recurring_window": []map[string]interface{}{
+					{
+						"start_time": mp.Window.RecurringWindow.Window.StartTime,
+						"end_time":   mp.Window.RecurringWindow.Window.EndTime,
+						"recurrence": mp.Window.RecurringWindow.Recurrence,
+					},
+				},
+				"maintenance_exclusion": exclusions,
+			},
+		}
+	}
+	return nil
 }
