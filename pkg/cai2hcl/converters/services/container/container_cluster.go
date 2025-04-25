@@ -88,9 +88,11 @@ func (c *ContainerClusterConverter) Convert(asset *caiasset.Asset) ([]*models.Te
 		blocks = append(blocks, clusterBlock)
 	}
 
+	autopilot := cluster.Autopilot != nil && cluster.Autopilot.Enabled
 	// Convert node pools to separate google_container_nood_pool objects,
 	// because cluster's nood_pool prop creates immutable node pools are recreated on import
-	if len(cluster.NodePools) > 0 {
+	// skip for autopilot cluster
+	if len(cluster.NodePools) > 0 && !autopilot {
 		for _, nodePool := range cluster.NodePools {
 			if nodePool == nil {
 				continue
@@ -137,21 +139,20 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 		hclData["description"] = cluster.Description
 	}
 
-	// From provider "initial_node_count" description:
-	// "Must be set if node_pool is not set.
-	// If you're using google_container_node_pool objects with no default node pool,
-	// you'll need to set this to a value of at least 1, alongside setting remove_default_node_pool to true."
+	autopilot := cluster.Autopilot != nil && cluster.Autopilot.Enabled
+
 	hasSeparateNodePools := false
 	if len(nodePools) > 1 || (len(nodePools) == 1 && nodePools[0] != nil && nodePools[0].Name != "default-pool") {
 		hasSeparateNodePools = true
 	}
-	// We don't want to support "node_pool" list since node pools are going to be recreated on every change
 	if hasSeparateNodePools {
-		// Scenario 1: Separate node pools exist or will be created
-		hclData["remove_default_node_pool"] = true // Default is false, so set true
-		hclData["initial_node_count"] = 1          // it's going to be removed so let's set min value
+		// We're using google_container_node_pool objects with no default node pool,
+		// since node pools are going to be recreated on every change
+		if !autopilot {
+			hclData["remove_default_node_pool"] = true // Default is false, so set true
+		}
 	} else {
-		// Scenario 2: Only the default node pool exists, manage with cluster block
+		// Only the default node pool exists, manage with cluster block
 		if cluster.InitialNodeCount > 0 {
 			hclData["initial_node_count"] = cluster.InitialNodeCount
 		}
@@ -228,20 +229,21 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 		if cluster.NetworkConfig.EnableMultiNetworking {
 			hclData["enable_multi_networking"] = true
 		}
-		// enable_intranode_visibility: Omit if false (default)
-		if cluster.NetworkConfig.EnableIntraNodeVisibility {
+		// enable_intranode_visibility: skip for autopilot
+		if !autopilot && cluster.NetworkConfig.EnableIntraNodeVisibility {
 			hclData["enable_intranode_visibility"] = true
 		}
 	}
 
-	// Default Max Pods Constraint: Omit if 0/nil (check API default)
-	if cluster.DefaultMaxPodsConstraint != nil && cluster.DefaultMaxPodsConstraint.MaxPodsPerNode > 0 {
+	// Default Max Pods Constraint: Omit for autopilot clusters.
+	if !autopilot && cluster.DefaultMaxPodsConstraint != nil && cluster.DefaultMaxPodsConstraint.MaxPodsPerNode > 0 {
 		hclData["default_max_pods_per_node"] = cluster.DefaultMaxPodsConstraint.MaxPodsPerNode
 	}
 
-	// Always include network_policy, will default to disabled with PROVIDER_UNSPECIFIED if not specified
-	hclData["network_policy"] = flattenNetworkPolicy(cluster.NetworkPolicy)
-
+	// Skip network_policy for autopilot, but include default for standart cluster
+	if !autopilot {
+		hclData["network_policy"] = flattenNetworkPolicy(cluster.NetworkPolicy)
+	}
 	// Converts only MaintenanceWindow
 	hclData["maintenance_policy"] = flattenMaintenancePolicy(cluster.MaintenancePolicy)
 
@@ -259,7 +261,7 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 	}
 
 	// Addons Config: omit if nil or only contains defaults
-	if flattened := flattenAddonsConfig(cluster.AddonsConfig); flattened != nil {
+	if flattened := flattenAddonsConfig(cluster.AddonsConfig, autopilot); flattened != nil {
 		hclData["addons_config"] = flattened
 	}
 
@@ -279,8 +281,8 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 	// Always include release_channel, will default to UNSPECIFIED if not specified
 	hclData["release_channel"] = flattenReleaseChannel(cluster.ReleaseChannel)
 
-	// Boolean flags - Omit if default (usually false, check schema)
-	if cluster.Autopilot != nil && cluster.Autopilot.Enabled {
+	// autopilot flaf is widly used and defined on top
+	if autopilot {
 		hclData["enable_autopilot"] = true
 		if cluster.Autopilot.WorkloadPolicyConfig != nil {
 			hclData["allow_net_admin"] = cluster.Autopilot.WorkloadPolicyConfig.AllowNetAdmin
@@ -303,7 +305,8 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 		hclData["enable_legacy_abac"] = true
 	}
 
-	if cluster.ShieldedNodes != nil {
+	// should not be set for autopilot cluster
+	if cluster.ShieldedNodes != nil && !autopilot {
 		hclData["enable_shielded_nodes"] = cluster.ShieldedNodes.Enabled
 	}
 
@@ -325,9 +328,13 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 	if flattened := flattenPrivateClusterConfigAdapted(cluster.PrivateClusterConfig, cluster.NetworkConfig); flattened != nil {
 		hclData["private_cluster_config"] = flattened
 	}
-	if flattened := flattenClusterAutoscaling(cluster.Autoscaling); flattened != nil {
-		hclData["cluster_autoscaling"] = flattened
+
+	if !autopilot {
+		if flattened := flattenClusterAutoscaling(cluster.Autoscaling); flattened != nil {
+			hclData["cluster_autoscaling"] = flattened
+		}
 	}
+
 	// Always include database_encryption, will default to DECRYPTED if not specified
 	hclData["database_encryption"] = flattenDatabaseEncryption(cluster.DatabaseEncryption)
 
@@ -369,15 +376,9 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 		hclData["node_pool_defaults"] = flattened
 	}
 
-	if flattened := flattenNodePoolAutoConfig(cluster.NodePoolAutoConfig); len(flattened) > 0 && len(flattened[0]) > 0 {
-		hclData["node_pool_auto_config"] = flattened
-	}
-
-	// Check if HCL data is empty - might happen if importing a very default cluster
-	if len(hclData) <= 2 { // Only name and location were set
-		fmt.Printf("Warning: Cluster %s resulted in minimal HCL data after omitting defaults.\n", clusterName)
-		// Decide if returning nil is appropriate. It depends on whether the cluster resource itself is truly optional.
-		// For now, return the minimal block.
+	flattenedNPAC := flattenNodePoolAutoConfig(cluster.NodePoolAutoConfig)
+	if len(flattenedNPAC) > 0 && len(flattenedNPAC[0]) > 0 {
+		hclData["node_pool_auto_config"] = flattenedNPAC
 	}
 
 	// Final conversion to cty.Value using the schema
@@ -490,14 +491,6 @@ func (c *ContainerClusterConverter) convertNodePoolData(nodePool *container.Node
 
 	// Always include queued_provisioning with enabled=false as the default
 	hclData["queued_provisioning"] = flattenQueuedProvisioning(nodePool.QueuedProvisioning)
-
-	// Check if HCL data is empty (beyond required fields name, cluster, location, project)
-	if len(hclData) <= 4 {
-		fmt.Printf("Warning: Node Pool %s resulted in minimal HCL data after omitting defaults.\n", nodePool.Name)
-		// Return nil, as an empty node pool block is likely an error or redundant.
-		// return nil, nil
-		// Let's return minimal block for now, user might want explicit definition.
-	}
 
 	// Final conversion to cty.Value using the schema
 	ctyVal, err := utils.MapToCtyValWithSchema(hclData, c.nodePoolSchema)
@@ -1163,7 +1156,7 @@ func flattenIPAllocationPolicy(policy *container.IPAllocationPolicy) []interface
 }
 
 // flattenAddonsConfig: Omit addons if they match their specific defaults. Nil if block empty.
-func flattenAddonsConfig(config *container.AddonsConfig) []interface{} {
+func flattenAddonsConfig(config *container.AddonsConfig, autopilot bool) []interface{} {
 	if config == nil {
 		return nil
 	}
@@ -1196,8 +1189,8 @@ func flattenAddonsConfig(config *container.AddonsConfig) []interface{} {
 		addons["cloudrun_config"] = []interface{}{crc}
 		hasNonDefaultConfig = true
 	}
-	// DnsCache Config: Default disabled (enabled: false)
-	if config.DnsCacheConfig != nil && config.DnsCacheConfig.Enabled { // Include only if explicitly enabled
+	// DnsCache Config: Default disabled (enabled: false) and should be used for autopilot
+	if config.DnsCacheConfig != nil && config.DnsCacheConfig.Enabled && !autopilot {
 		addons["dns_cache_config"] = []interface{}{map[string]interface{}{"enabled": true}}
 		hasNonDefaultConfig = true
 	}
@@ -1226,8 +1219,8 @@ func flattenAddonsConfig(config *container.AddonsConfig) []interface{} {
 		addons["gcs_fuse_csi_driver_config"] = []interface{}{map[string]interface{}{"enabled": true}}
 		hasNonDefaultConfig = true
 	}
-	// Stateful HA Config: Default disabled. Include only if explicitly enabled.
-	if config.StatefulHaConfig != nil && config.StatefulHaConfig.Enabled {
+	// Stateful HA Config: Default disabled. Also should be enabled for autopilot.
+	if config.StatefulHaConfig != nil && config.StatefulHaConfig.Enabled && !autopilot {
 		addons["stateful_ha_config"] = []interface{}{map[string]interface{}{"enabled": true}}
 		hasNonDefaultConfig = true
 	}
@@ -1738,57 +1731,51 @@ func flattenMonitoringConfig(config *container.MonitoringConfig) []interface{} {
 		mc["enable_components"] = defaultComponents
 	}
 
-	// Managed Prometheus: Always include with default enabled=true
-	mpc := make(map[string]interface{})
-
-	// Default to enabled=true
-	mpc["enabled"] = true
-
-	// Override if explicitly set to false
-	if config != nil && config.ManagedPrometheusConfig != nil && !config.ManagedPrometheusConfig.Enabled {
-		mpc["enabled"] = false
+	if flattened := flattenManagedPrometheusConfig(config.ManagedPrometheusConfig); flattened != nil {
+		mc["managed_prometheus"] = flattened
 	}
 
-	// Always include auto_monitoring_config with default scope=NONE
-	amc := map[string]interface{}{"scope": "NONE"}
-
-	// AutoMonitoringConfig is not available in the v1 API - the commented code would work with v1beta1
-	// Instead, just use the default scope value
-	// if config != nil && config.ManagedPrometheusConfig != nil &&
-	//    config.ManagedPrometheusConfig.AutoMonitoringConfig != nil &&
-	//    config.ManagedPrometheusConfig.AutoMonitoringConfig.Scope != "" {
-	//	amc["scope"] = config.ManagedPrometheusConfig.AutoMonitoringConfig.Scope
-	// }
-
-	// Add auto_monitoring_config to managed_prometheus
-	mpc["auto_monitoring_config"] = []interface{}{amc}
-
-	// Add managed_prometheus to monitoring_config
-	mc["managed_prometheus"] = []interface{}{mpc}
-
-	// Advanced Datapath Observability: Include if present
-	if config.AdvancedDatapathObservabilityConfig != nil {
-		adoc := make(map[string]interface{})
-
-		// Include metrics setting if true
-		if config.AdvancedDatapathObservabilityConfig.EnableMetrics {
-			adoc["enable_metrics"] = true
-		}
-
-		// Include relay_mode if specified
-		if config.AdvancedDatapathObservabilityConfig.RelayMode != "" && config.AdvancedDatapathObservabilityConfig.RelayMode != "RELAY_MODE_UNSPECIFIED" {
-			adoc["relay_mode"] = config.AdvancedDatapathObservabilityConfig.RelayMode
-		}
-
-		if len(adoc) > 0 {
-			mc["advanced_datapath_observability_config"] = []interface{}{adoc}
-		}
+	flattenedADO := flattenAdvancedDatapathObservabilityConfig(config.AdvancedDatapathObservabilityConfig)
+	if flattenedADO != nil {
+		mc["advanced_datapath_observability_config"] = flattenedADO
 	}
 
 	return []interface{}{mc}
 }
 
-// flattenClusterAutoscaling: Omit fields if default. Nil if block empty/default.
+func flattenManagedPrometheusConfig(c *container.ManagedPrometheusConfig) []map[string]interface{} {
+	if c == nil || !c.Enabled || c.AutoMonitoringConfig == nil && c.AutoMonitoringConfig.Scope == "" {
+		return nil
+	}
+
+	result := make(map[string]interface{})
+	result["enabled"] = c.Enabled
+
+	autoMonitoringList := []map[string]interface{}{}
+	autoMonitoringMap := map[string]interface{}{
+		"scope": c.AutoMonitoringConfig.Scope,
+	}
+	autoMonitoringList = append(autoMonitoringList, autoMonitoringMap)
+
+	result["auto_monitoring_config"] = autoMonitoringList
+
+	return []map[string]interface{}{result}
+}
+
+func flattenAdvancedDatapathObservabilityConfig(c *container.AdvancedDatapathObservabilityConfig) []map[string]interface{} {
+	if c == nil || !c.EnableMetrics && !c.EnableRelay {
+		return nil
+	}
+
+	return []map[string]interface{}{
+		{
+			"enable_metrics": c.EnableMetrics,
+			"enable_relay":   c.EnableRelay,
+		},
+	}
+}
+
+// flattenClusterAutoscaling: we should omit whole block for autopilot clusters.
 func flattenClusterAutoscaling(autoscaling *container.ClusterAutoscaling) []interface{} {
 	if autoscaling == nil || !autoscaling.EnableNodeAutoprovisioning {
 		return nil
@@ -1805,8 +1792,7 @@ func flattenClusterAutoscaling(autoscaling *container.ClusterAutoscaling) []inte
 		ca["autoprovisioning_locations"] = autoscaling.AutoprovisioningLocations
 	}
 
-	resourceLimitsBlock := flattenResourceLimits(autoscaling.ResourceLimits)
-	if resourceLimitsBlock != nil {
+	if resourceLimitsBlock := flattenResourceLimits(autoscaling.ResourceLimits); resourceLimitsBlock != nil {
 		ca["resource_limits"] = resourceLimitsBlock
 	}
 
