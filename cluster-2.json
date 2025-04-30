@@ -1,0 +1,184 @@
+[{"name":"//container.googleapis.com/projects/cluster-converter-1/locations/us-central2/clusters/autopilot-cluster-2","asset_type":"container.googleapis.com/Cluster","resource":{"version":"v1","discovery_document_uri":"https://container.googleapis.com/$discovery/rest","discovery_name":"Cluster","parent":"//cloudresourcemanager.googleapis.com/projects/1089806473266","data":{"name": "autopilot-cluster-2",
+    "network": "projects/cluster-converter-1/global/networks/default",
+    "subnetwork": "projects/cluster-converter-1/regions/us-central2/subnetworks/default",
+    "locations": [
+      "us-central2-a",
+      "us-central2-b",
+      "us-central2-c",
+      "us-central2-d"
+    ],
+    "networkPolicy": {},
+    "ipAllocationPolicy": {
+      "useIpAliases": true,
+      "stackType": "IPV4"
+    },
+    "maintenancePolicy": {
+      "window": {
+        "recurringWindow": {
+          "window": {
+            "startTime": "2025-04-28T22:00:00Z",
+            "endTime": "2025-04-29T19:00:00Z"
+          },
+          "recurrence": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU"
+        }
+      }
+    },
+    "binaryAuthorization": {
+      "evaluationMode": "DISABLED"
+    },
+    "autoscaling": {
+      "enableNodeAutoprovisioning": true,
+      "resourceLimits": [
+        {
+          "resourceType": "cpu",
+          "maximum": "1000000000"
+        },
+        {
+          "resourceType": "memory",
+          "maximum": "1000000000"
+        },
+        {
+          "resourceType": "nvidia-tesla-t4",
+          "maximum": "1000000000"
+        },
+        {
+          "resourceType": "nvidia-tesla-a100",
+          "maximum": "1000000000"
+        }
+      ],
+      "autoscalingProfile": "OPTIMIZE_UTILIZATION",
+      "autoprovisioningNodePoolDefaults": {
+        "oauthScopes": [
+          "https://www.googleapis.com/auth/cloud-platform"
+        ],
+        "upgradeSettings": {
+          "maxSurge": 1,
+          "strategy": "SURGE"
+        },
+        "management": {
+          "autoUpgrade": true,
+          "autoRepair": true
+        },
+        "minCpuPlatform": "Automatic",
+        "imageType": "COS_CONTAINERD"
+      }
+    },
+    "networkConfig": {
+      "enableIntraNodeVisibility": true,
+      "datapathProvider": "ADVANCED_DATAPATH",
+      "dnsConfig": {
+        "clusterDns": "CLOUD_DNS",
+        "clusterDnsScope": "CLUSTER_SCOPE"
+      },
+      "gatewayApiConfig": {
+        "channel": "CHANNEL_STANDARD"
+      },
+      "defaultEnablePrivateNodes": true,
+      "disableL4LbFirewallReconciliation": true
+    },
+    "defaultMaxPodsConstraint": {
+      "maxPodsPerNode": "110"
+    },
+    "authenticatorGroupsConfig": {},
+    "databaseEncryption": {
+      "state": "DECRYPTED"
+    },
+    "verticalPodAutoscaling": {
+      "enabled": true
+    },
+    "releaseChannel": {
+      "channel": "REGULAR"
+    },
+    "workloadIdentityConfig": {
+      "workloadPool": "cluster-converter-1.svc.id.goog"
+    },
+    "notificationConfig": {
+      "pubsub": {}
+    },
+    "initialClusterVersion": "1.32.2-gke.1182003",
+    "location": "us-central2",
+    "autopilot": {
+      "enabled": true
+    },
+    "nodePoolDefaults": {
+      "nodeConfigDefaults": {
+        "gcfsConfig": {
+          "enabled": true
+        }
+      }
+    },
+    "loggingConfig": {
+      "componentConfig": {
+        "enableComponents": [
+          "SYSTEM_COMPONENTS",
+          "WORKLOADS",
+          "APISERVER",
+          "SCHEDULER",
+          "CONTROLLER_MANAGER",
+          "KCP_HPA"
+        ]
+      }
+    },
+    "monitoringConfig": {
+      "componentConfig": {
+        "enableComponents": [
+          "SYSTEM_COMPONENTS",
+          "APISERVER",
+          "SCHEDULER",
+          "CONTROLLER_MANAGER",
+          "STORAGE",
+          "POD",
+          "DEPLOYMENT",
+          "STATEFULSET",
+          "DAEMONSET",
+          "HPA",
+          "JOBSET",
+          "CADVISOR",
+          "KUBELET",
+          "DCGM"
+        ]
+      },
+      "managedPrometheusConfig": {
+        "enabled": true,
+        "autoMonitoringConfig": {
+          "scope": "NONE"
+        }
+      }
+    },
+    "nodePoolAutoConfig": {
+      "resourceManagerTags": {}
+    },
+    "protectConfig": {
+      "workloadConfig": {
+        "auditMode": "BASIC"
+      },
+      "workloadVulnerabilityMode": "BASIC"
+    },
+    "fleet": {
+      "project": "cluster-converter-1"
+    },
+    "securityPostureConfig": {
+      "mode": "BASIC",
+      "vulnerabilityMode": "VULNERABILITY_BASIC"
+    },
+    "controlPlaneEndpointsConfig": {
+      "dnsEndpointConfig": {
+        "allowExternalTraffic": true
+      },
+      "ipEndpointsConfig": {
+        "enabled": true,
+        "enablePublicEndpoint": true,
+        "globalAccess": false,
+        "authorizedNetworksConfig": {
+          "enabled": true,
+          "gcpPublicCidrsAccessEnabled": false,
+          "privateEndpointEnforcementEnabled": true
+        }
+      }
+    },
+    "enterpriseConfig": {
+      "desiredTier": "ENTERPRISE"
+    },
+    "secretManagerConfig": {
+      "enabled": true
+    }},"location":"us-central2"},"ancestors":["projects/1089806473266","folders/261046259366","organizations/433637338589"],"update_time":"2025-04-16T08:59:35.761800Z"}]

@@ -12,12 +12,36 @@ import (
 	"github.com/hashicorp/terraform-provider-google-beta/google-beta/tpgresource"
 	"google.golang.org/api/container/v1"
 	// TODO: Consider adding v1beta1 support for features like auto_monitoring_config
-	// "google.golang.org/api/container/v1beta1"
 )
 
-const ContainerClusterAssetType string = "container.googleapis.com/Cluster"
-const ContainerClusterSchemaName string = "google_container_cluster"
-const ContainerNodePoolSchemaName string = "google_container_node_pool"
+const (
+	ContainerClusterAssetType         string = "container.googleapis.com/Cluster"
+	ContainerClusterSchemaName        string = "google_container_cluster"
+	ContainerNodePoolSchemaName       string = "google_container_node_pool"
+	GpuSharingStrategyUnspecified     string = "GPU_SHARING_STRATEGY_UNSPECIFIED"
+	EffectUnspecified                 string = "EFFECT_UNSPECIFIED"
+	LocationPolicyUnspecified         string = "LOCATION_POLICY_UNSPECIFIED"
+	NodePoolUpdateStrategyUnspecified string = "NODE_POOL_UPDATE_STRATEGY_UNSPECIFIED"
+	ProfileUnspecified                string = "PROFILE_UNSPECIFIED"
+	TypeUnspecified                   string = "TYPE_UNSPECIFIED"
+	ClusterTierUnspecified            string = "CLUSTER_TIER_UNSPECIFIED"
+	ModeUnspecified                   string = "MODE_UNSPECIFIED"
+	VulnerabilityModeUnspecified      string = "VULNERABILITY_MODE_UNSPECIFIED"
+	ChannelUnspecified                string = "UNSPECIFIED"
+	DecryptedState                    string = "DECRYPTED"
+	EncryptedState                    string = "ENCRYPTED"
+	ProviderUnspecified               string = "PROVIDER_UNSPECIFIED"
+	DefaultEnterpriseTier             string = "STANDARD"
+	DefaultAutoscalingProfile         string = "BALANCED"
+	DefaultUpgradeStrategy            string = "SURGE"
+	DefaultNodeManagementEnabled      bool   = true
+	DefaultNetworkPolicyEnabled       bool   = false
+	DefaultSoakDuration               string = "0s"
+	DefaultMaxSurgeNodes              int64  = 1
+	DefaultMaxUnavailableNodes        int64  = 0
+	DefaultLinuxCgroupMode            string = "CGROUP_MODE_UNSPECIFIED"
+	DefaultDNSScope                   string = "DNS_SCOPE_UNSPECIFIED"
+)
 
 type ContainerClusterConverter struct {
 	clusterName    string
@@ -376,9 +400,8 @@ func (c *ContainerClusterConverter) convertClusterData(cluster *container.Cluste
 		hclData["node_pool_defaults"] = flattened
 	}
 
-	flattenedNPAC := flattenNodePoolAutoConfig(cluster.NodePoolAutoConfig)
-	if len(flattenedNPAC) > 0 && len(flattenedNPAC[0]) > 0 {
-		hclData["node_pool_auto_config"] = flattenedNPAC
+	if flattened := flattenNodePoolAutoConfig(cluster.NodePoolAutoConfig); flattened != nil {
+		hclData["node_pool_auto_config"] = flattened
 	}
 
 	// Final conversion to cty.Value using the schema
@@ -545,19 +568,14 @@ func flattenAdvancedMachineFeatures(config *container.AdvancedMachineFeatures) [
 // flattenNodeConfig now checks against defaults and returns nil if only defaults are present.
 func flattenNodeConfig(config *container.NodeConfig) []interface{} {
 	if config == nil {
-		// Create default node config with our required defaults
-		nodeConfig := make(map[string]interface{})
-
-		// Always include advanced_machine_features with default values
-		nodeConfig["advanced_machine_features"] = flattenAdvancedMachineFeatures(nil)
-
-		// Always include empty resource_manager_tags
-		nodeConfig["resource_manager_tags"] = make(map[string]string)
-
-		return []interface{}{nodeConfig}
+		return nil
 	}
-
+	// Create default node config with our required defaults
 	nodeConfig := make(map[string]interface{})
+
+	// Always include empty resource_manager_tags
+	nodeConfig["resource_manager_tags"] = make(map[string]string)
+
 	// Always include advanced_machine_features with default values
 	nodeConfig["advanced_machine_features"] = flattenAdvancedMachineFeatures(config.AdvancedMachineFeatures)
 
@@ -695,10 +713,6 @@ func flattenNodeConfig(config *container.NodeConfig) []interface{} {
 		nodeConfig["taint"] = flattened
 	}
 
-	if flattened := flattenNodeTaints(config.Taints); flattened != nil {
-		nodeConfig["taint"] = flattened
-	}
-
 	// resource_manager_tags: Always include empty map as default
 	if config.ResourceManagerTags != nil && len(config.ResourceManagerTags.Tags) > 0 {
 		nodeConfig["resource_manager_tags"] = config.ResourceManagerTags.Tags
@@ -795,7 +809,7 @@ func flattenGpuSharingConfig(config *container.GPUSharingConfig) []interface{} {
 		return nil
 	}
 	// Strategy must be non-empty and not the default unspecified value.
-	if config.GpuSharingStrategy == "" || config.GpuSharingStrategy == "GPU_SHARING_STRATEGY_UNSPECIFIED" {
+	if config.GpuSharingStrategy == "" || config.GpuSharingStrategy == GpuSharingStrategyUnspecified {
 		return nil
 	}
 
@@ -818,12 +832,12 @@ func flattenGpuDriverInstallationConfig(config *container.GPUDriverInstallationC
 
 // flattenReservationAffinity: Omit block if type is unspecified
 func flattenReservationAffinity(config *container.ReservationAffinity) []interface{} {
-	if config == nil || config.ConsumeReservationType == "" {
-		return nil
-	}
-
 	ra := make(map[string]interface{})
-	ra["consume_reservation_type"] = config.ConsumeReservationType
+	if config == nil || config.ConsumeReservationType == "" {
+		ra["consume_reservation_type"] = "NO_RESERVATION"
+	} else {
+		ra["consume_reservation_type"] = config.ConsumeReservationType
+	}
 
 	if config.ConsumeReservationType == "SPECIFIC_RESERVATION" {
 		if config.Key != "" {
@@ -979,7 +993,7 @@ func flattenNodeTaints(taints []*container.NodeTaint) []interface{} {
 		if taint == nil {
 			continue
 		}
-		if taint.Effect == "" || taint.Effect == "EFFECT_UNSPECIFIED" {
+		if taint.Effect == "" || taint.Effect == EffectUnspecified {
 			continue // Skip invalid/default effect
 		}
 		t := make(map[string]interface{})
@@ -1268,7 +1282,7 @@ func flattenNetworkPolicy(c *container.NetworkPolicy) []map[string]interface{} {
 		// Explicitly set the network policy to the default.
 		result = append(result, map[string]interface{}{
 			"enabled":  false,
-			"provider": "PROVIDER_UNSPECIFIED",
+			"provider": ProviderUnspecified,
 		})
 	}
 	return result
@@ -1299,7 +1313,7 @@ func flattenNodePoolAutoscaling(autoscaling *container.NodePoolAutoscaling) []in
 		// REMOVED: hasNonDefaultConfig = true // Unused
 	}
 	// Location policy: Omit if default (UNSPECIFIED)
-	if autoscaling.LocationPolicy != "" && autoscaling.LocationPolicy != "LOCATION_POLICY_UNSPECIFIED" {
+	if autoscaling.LocationPolicy != "" && autoscaling.LocationPolicy != LocationPolicyUnspecified {
 		data["location_policy"] = autoscaling.LocationPolicy
 		// REMOVED: hasNonDefaultConfig = true // Unused
 	}
@@ -1358,10 +1372,8 @@ func flattenUpgradeSettings(settings *container.UpgradeSettings) []interface{} {
 		data["max_unavailable"] = settings.MaxUnavailable
 		hasNonDefaultConfig = true
 	}
-
-	// Strategy: Omit if default (UNSPECIFIED or SURGE?). Assume SURGE is often default if unspecified. Check provider.
 	strategyDefault := "SURGE" // Verify this default
-	if settings.Strategy != "" && settings.Strategy != "NODE_POOL_UPDATE_STRATEGY_UNSPECIFIED" && settings.Strategy != strategyDefault {
+	if settings.Strategy != "" && settings.Strategy != NodePoolUpdateStrategyUnspecified && settings.Strategy != strategyDefault {
 		data["strategy"] = settings.Strategy
 		hasNonDefaultConfig = true
 	}
@@ -1541,7 +1553,7 @@ func flattenPlacementPolicy(policy *container.PlacementPolicy) []interface{} {
 	hasNonDefaultConfig := false
 
 	// Type: Omit if default (TYPE_UNSPECIFIED)
-	if policy.Type != "" && policy.Type != "TYPE_UNSPECIFIED" {
+	if policy.Type != "" && policy.Type != TypeUnspecified {
 		data["type"] = policy.Type
 		hasNonDefaultConfig = true
 	}
@@ -1689,7 +1701,7 @@ func flattenPrivateClusterConfigAdapted(config *container.PrivateClusterConfig, 
 func flattenReleaseChannel(rc *container.ReleaseChannel) []interface{} {
 	// Return "default block" if value is absent
 	if rc == nil || rc.Channel == "" {
-		return []interface{}{map[string]interface{}{"channel": "UNSPECIFIED"}}
+		return []interface{}{map[string]interface{}{"channel": ChannelUnspecified}}
 	}
 	// Return block with specified channel
 	return []interface{}{map[string]interface{}{"channel": rc.Channel}}
@@ -1784,7 +1796,7 @@ func flattenClusterAutoscaling(autoscaling *container.ClusterAutoscaling) []inte
 	ca := make(map[string]interface{})
 	ca["enabled"] = autoscaling.EnableNodeAutoprovisioning
 	// Autoscaling Profile: Default "BALANCED". Omit if matches.
-	if autoscaling.AutoscalingProfile != "" && autoscaling.AutoscalingProfile != "PROFILE_UNSPECIFIED" && autoscaling.AutoscalingProfile != "BALANCED" {
+	if autoscaling.AutoscalingProfile != "" && autoscaling.AutoscalingProfile != ProfileUnspecified && autoscaling.AutoscalingProfile != "BALANCED" {
 		ca["autoscaling_profile"] = autoscaling.AutoscalingProfile
 	}
 
@@ -1904,29 +1916,21 @@ func flattenAutoprovisioningDefaults(defaults *container.AutoprovisioningNodePoo
 
 // flattenDatabaseEncryption: Always include database_encryption block
 func flattenDatabaseEncryption(config *container.DatabaseEncryption) []interface{} {
-	// If config is nil, return a default config with state "DECRYPTED"
-	if config == nil {
-		de := make(map[string]interface{})
-		de["state"] = "DECRYPTED"
+	// If config is nil, return a default config
+	de := make(map[string]interface{})
+	if config == nil || config.State == "" {
+		de["state"] = DecryptedState
 		return []interface{}{de}
 	}
 
-	de := make(map[string]interface{})
-
-	// Always set the state, default to "DECRYPTED" if empty or unspecified
-	if config.State == "" || config.State == "DECRYPTION_STATE_UNSPECIFIED" {
-		de["state"] = "DECRYPTED"
-	} else {
-		de["state"] = config.State
-	}
-
+	de["state"] = config.State
 	// Only include key_name if state is ENCRYPTED and key_name is provided
-	if config.State == "ENCRYPTED" {
+	if config.State == EncryptedState {
 		if config.KeyName != "" {
 			de["key_name"] = config.KeyName
 		} else {
-			fmt.Println("Warning: DatabaseEncryption state is ENCRYPTED but key_name is missing. Setting state to DECRYPTED.")
-			de["state"] = "DECRYPTED"
+			// DatabaseEncryption state is ENCRYPTED but key_name is missing. Setting state to DECRYPTED
+			de["state"] = DecryptedState
 		}
 	}
 
@@ -1935,18 +1939,18 @@ func flattenDatabaseEncryption(config *container.DatabaseEncryption) []interface
 
 // flattenEnterpriseConfig: Always include enterprise_config block with desired_tier
 func flattenEnterpriseConfig(config *container.EnterpriseConfig) []interface{} {
-	// If config is nil, return a default config with desired_tier = "STANDARD"
+	// If config is nil, return a default config with tier = "STANDARD"
 	if config == nil {
 		ec := make(map[string]interface{})
-		ec["desired_tier"] = "STANDARD"
+		ec["desired_tier"] = DefaultEnterpriseTier
 		return []interface{}{ec}
 	}
 
 	ec := make(map[string]interface{})
 
 	// Always set the desired_tier, default to "STANDARD" if empty or unspecified
-	if config.DesiredTier == "" || config.DesiredTier == "CLUSTER_TIER_UNSPECIFIED" {
-		ec["desired_tier"] = "STANDARD"
+	if config.DesiredTier == "" || config.DesiredTier == ClusterTierUnspecified {
+		ec["desired_tier"] = DefaultEnterpriseTier
 	} else {
 		ec["desired_tier"] = config.DesiredTier
 	}
@@ -2011,7 +2015,7 @@ func flattenDnsConfig(dns *container.DNSConfig) []interface{} {
 		data["cluster_dns"] = dns.ClusterDns
 		hasNonDefaultConfig = true
 	}
-	// cluster_dns_scope: dont check "DNS_SCOPE_UNSPECIFIED"
+
 	if dns.ClusterDnsScope != "" {
 		data["cluster_dns_scope"] = dns.ClusterDnsScope
 		hasNonDefaultConfig = true
@@ -2023,7 +2027,7 @@ func flattenDnsConfig(dns *container.DNSConfig) []interface{} {
 	}
 	// additive_vpc_scope_dns_domain: Omit if empty.
 	if dns.AdditiveVpcScopeDnsDomain != "" {
-		data[""] = dns.AdditiveVpcScopeDnsDomain
+		data["additive_vpc_scope_dns_domain"] = dns.AdditiveVpcScopeDnsDomain
 		hasNonDefaultConfig = true
 	}
 
@@ -2041,11 +2045,11 @@ func flattenSecurityPostureConfig(config *container.SecurityPostureConfig) []int
 
 	result := map[string]interface{}{}
 
-	if config.Mode != "" && config.Mode != "MODE_UNSPECIFIED" {
+	if config.Mode != "" && config.Mode != ModeUnspecified {
 		result["mode"] = config.Mode
 	}
 
-	if config.VulnerabilityMode != "" && config.VulnerabilityMode != "VULNERABILITY_MODE_UNSPECIFIED" {
+	if config.VulnerabilityMode != "" && config.VulnerabilityMode != VulnerabilityModeUnspecified {
 		result["vulnerability_mode"] = config.VulnerabilityMode
 	}
 
@@ -2134,9 +2138,7 @@ func flattenWorkloadIdentityConfig(wic *container.WorkloadIdentityConfig) []inte
 		pool = wic.WorkloadPool
 	}
 
-	// Omit if pool is empty or matches the default pattern (project-id.svc.id.goog)
 	// TODO: Need project ID to check default pool name accurately.
-	// Simple check: omit if empty. Provider might compute default if omitted.
 	if pool != "" /* && !isDefaultWorkloadPool(pool, projectID) */ {
 		data["workload_pool"] = pool
 	} else {
@@ -2213,18 +2215,136 @@ func flattenNodePoolDefaults(defaults *container.NodePoolDefaults) []interface{}
 }
 
 // Flattens the nested node_config_defaults block, checking internal defaults
-func flattenNodeConfigDefaults(ncd *container.NodeConfigDefaults) []interface{} { // Assuming API struct name
-	if ncd == nil {
+func flattenNodeConfigDefaults(c *container.NodeConfigDefaults) []interface{} {
+	if c == nil {
 		return nil
 	}
 
 	ncdData := make(map[string]interface{})
-	hasNonDefaultConfig := false // Track if this nested block has anything non-default
+	hasContent := false
 
-	if !hasNonDefaultConfig {
+	// --- containerd_config ---
+	if c.ContainerdConfig != nil {
+		containerdBlock := flattenContainerdConfig(c.ContainerdConfig)
+		if containerdBlock != nil {
+			ncdData["containerd_config"] = containerdBlock
+			hasContent = true
+		}
+	}
+
+	// --- gcfs_config ---
+	if c.GcfsConfig != nil { // Or however you access the API field for gcfs_config
+		gcfsBlock := flattenGcfsConfig(c.GcfsConfig)
+		if gcfsBlock != nil {
+			ncdData["gcfs_config"] = gcfsBlock
+			hasContent = true
+		}
+	}
+
+	// --- insecure_kubelet_readonly_port_enabled ---
+	if c.NodeKubeletConfig != nil {
+		nkc := c.NodeKubeletConfig
+		ncdData["insecure_kubelet_readonly_port_enabled"] = flattenInsecureKubeletReadonlyPortEnabled(nkc)
+		hasContent = true
+	}
+
+	// --- logging_variant ---
+	lc := c.LoggingConfig
+	if lc != nil && lc.VariantConfig != nil && lc.VariantConfig.Variant != "" {
+		ncdData["logging_variant"] = lc.VariantConfig.Variant
+		hasContent = true
+	}
+
+	if !hasContent {
 		return nil
-	} // Nothing non-default found in node_config_defaults
+	}
+
 	return []interface{}{ncdData}
+}
+
+func flattenContainerdConfig(apiConfig *container.ContainerdConfig) []interface{} {
+	if apiConfig == nil {
+		return nil
+	}
+
+	containerdData := make(map[string]interface{})
+	hasContent := false
+
+	if apiConfig.PrivateRegistryAccessConfig != nil {
+		privateRegistryBlock := flattenPrivateRegistryAccessConfig(apiConfig.PrivateRegistryAccessConfig)
+		if privateRegistryBlock != nil {
+			containerdData["private_registry_access_config"] = privateRegistryBlock
+			hasContent = true
+		}
+	}
+
+	if !hasContent {
+		return nil // No meaningful content for the containerd_config block itself.
+	}
+
+	return []interface{}{containerdData}
+}
+
+func flattenPrivateRegistryAccessConfig(apiPRAConfig *container.PrivateRegistryAccessConfig) []interface{} {
+	if apiPRAConfig == nil {
+		return nil
+	}
+
+	praData := make(map[string]interface{})
+	praData["enabled"] = apiPRAConfig.Enabled
+
+	if len(apiPRAConfig.CertificateAuthorityDomainConfig) > 0 {
+		certsList := flattenCertificateAuthority(apiPRAConfig.CertificateAuthorityDomainConfig)
+		if certsList != nil { // certsList will be nil if the loop doesn't append anything valid
+			praData["certificate_authority_domain_config"] = certsList
+		}
+	}
+
+	// For now, strict mapping: if apiPRAConfig exists, create the block because "enabled" is required.
+	return []interface{}{praData}
+}
+
+func flattenCertificateAuthority(apiCADCList []*container.CertificateAuthorityDomainConfig) []interface{} {
+	if len(apiCADCList) == 0 {
+		return nil
+	}
+
+	resultList := make([]interface{}, 0, len(apiCADCList))
+	for _, apiCADCItem := range apiCADCList {
+		if apiCADCItem == nil || apiCADCItem.Fqdns == nil || apiCADCItem.GcpSecretManagerCertificateConfig == nil {
+			continue
+		}
+
+		cadcData := make(map[string]interface{})
+		cadcData["fqdns"] = apiCADCItem.Fqdns
+
+		if apiCADCItem.GcpSecretManagerCertificateConfig != nil {
+			certConfig := apiCADCItem.GcpSecretManagerCertificateConfig
+			gcpSecretBlock := flattenGcpSecretManagerCertificate(certConfig)
+			if gcpSecretBlock != nil { // This flattener should always return a block if input is valid.
+				cadcData["gcp_secret_manager_certificate_config"] = gcpSecretBlock
+			} else {
+				// API data for a required sub-block is missing/invalid.
+				continue
+			}
+		}
+		resultList = append(resultList, cadcData)
+	}
+
+	if len(resultList) == 0 {
+		return nil
+	}
+	return resultList
+}
+
+func flattenGcpSecretManagerCertificate(apiGSMCC *container.GCPSecretManagerCertificateConfig) []interface{} {
+	if apiGSMCC == nil || apiGSMCC.SecretUri == "" {
+		return nil
+	}
+
+	gsmccData := make(map[string]interface{})
+	gsmccData["secret_uri"] = apiGSMCC.SecretUri
+	return []interface{}{gsmccData}
 }
 
 func flattenAuthenticatorGroupsConfig(c *container.AuthenticatorGroupsConfig) []map[string]interface{} {
@@ -2296,59 +2416,80 @@ func flattenControlPlaneEndpointsConfig(config *container.ControlPlaneEndpointsC
 	return []interface{}{result}
 }
 
-func flattenNodePoolAutoConfig(c *container.NodePoolAutoConfig) []map[string]interface{} {
+func flattenNodePoolAutoConfig(c *container.NodePoolAutoConfig) []interface{} {
 	if c == nil {
 		return nil
 	}
 
-	result := make(map[string]interface{})
+	data := make(map[string]interface{})
+
 	if c.NodeKubeletConfig != nil {
-		result["node_kubelet_config"] = flattenNodePoolAutoConfigNodeKubeletConfig(c.NodeKubeletConfig)
-	}
-	if c.NetworkTags != nil {
-		result["network_tags"] = flattenNodePoolAutoConfigNetworkTags(c.NetworkTags)
-	}
-	if c.ResourceManagerTags != nil {
-		result["resource_manager_tags"] = flattenResourceManagerTags(c.ResourceManagerTags)
-	}
-	if c.LinuxNodeConfig != nil {
-		result["linux_node_config"] = []map[string]interface{}{
-			{"cgroup_mode": c.LinuxNodeConfig.CgroupMode},
+		kubeletConfigBlock := flattenNodePoolAutoConfigNodeKubeletConfig(c.NodeKubeletConfig)
+		if kubeletConfigBlock != nil {
+			data["node_kubelet_config"] = kubeletConfigBlock
 		}
 	}
 
-	return []map[string]interface{}{result}
+	if c.NetworkTags != nil {
+		networkTagsVal := flattenNodePoolAutoConfigNetworkTags(c.NetworkTags)
+		if networkTagsVal != nil {
+			data["network_tags"] = networkTagsVal
+		}
+	}
+
+	if c.ResourceManagerTags != nil {
+		resourceManagerTagsMap := flattenResourceManagerTags(c.ResourceManagerTags)
+		if resourceManagerTagsMap != nil {
+			data["resource_manager_tags"] = resourceManagerTagsMap
+		}
+	}
+
+	if c.LinuxNodeConfig != nil {
+		linuxNodeConfigContents := make(map[string]interface{})
+		if c.LinuxNodeConfig.CgroupMode != "" {
+			linuxNodeConfigContents["cgroup_mode"] = c.LinuxNodeConfig.CgroupMode
+		}
+
+		if len(linuxNodeConfigContents) > 0 {
+			data["linux_node_config"] = []interface{}{linuxNodeConfigContents}
+		}
+	}
+
+	if len(data) == 0 {
+		return nil
+	}
+
+	return []interface{}{data}
 }
 
 func flattenNodePoolAutoConfigNetworkTags(c *container.NetworkTags) []map[string]interface{} {
-	if c == nil {
+	if c == nil || len(c.Tags) == 0 {
 		return nil
 	}
 
-	result := make(map[string]interface{})
-	if c.Tags != nil {
-		result["tags"] = c.Tags
+	return []map[string]interface{}{
+		{
+			"tags": c.Tags,
+		},
 	}
-	return []map[string]interface{}{result}
 }
 
 func flattenNodePoolAutoConfigNodeKubeletConfig(c *container.NodeKubeletConfig) []map[string]interface{} {
-	result := []map[string]interface{}{}
-	if c != nil {
-		result = append(result, map[string]interface{}{
-			"insecure_kubelet_readonly_port_enabled": flattenInsecureKubeletReadonlyPortEnabled(c),
-		})
-	}
-	return result
-}
-
-func flattenResourceManagerTags(c *container.ResourceManagerTags) map[string]interface{} {
 	if c == nil {
 		return nil
 	}
+	return []map[string]interface{}{
+		{
+			"insecure_kubelet_readonly_port_enabled": flattenInsecureKubeletReadonlyPortEnabled(c),
+		},
+	}
+}
 
+func flattenResourceManagerTags(c *container.ResourceManagerTags) map[string]interface{} {
+	if c == nil || len(c.Tags) == 0 {
+		return nil
+	}
 	rmt := make(map[string]interface{})
-
 	for k, v := range c.Tags {
 		rmt[k] = v
 	}
